@@ -198,35 +198,62 @@ function primeNeighbours() {
   if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 1200 }); else setTimeout(run, 250);
 }
 
-/* --- hi-res viewport render --- */
+/* --- hi-res viewport render: draw offscreen, then swap in one go --- */
+
+let stageCv = null, stageCtx = null;
+
+function ensureStage(dpr) {
+  const w = Math.round(cw * dpr), h = Math.round(ch * dpr);
+  if (!stageCv) {
+    stageCv = document.createElement('canvas');
+    stageCtx = stageCv.getContext('2d', { alpha: true });
+  }
+  if (stageCv.width !== w || stageCv.height !== h) { stageCv.width = w; stageCv.height = h; }
+  return stageCtx;
+}
 
 async function renderHi() {
   if (!page) return;
-  if (renderTask) { try { renderTask.cancel(); } catch {} renderTask = null; }
+  if (renderTask) { try { renderTask.cancel(); } catch {} }
+  renderTask = null;
+
   const dpr = hiDpr();
-  ensureCanvas(dpr);
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  const viewport = page.getViewport({ scale: s * dpr });
+  const sWant = s, txWant = tx, tyWant = ty, pageWant = pageNum;
+  const sc = ensureStage(dpr);
+  sc.setTransform(1, 0, 0, 1, 0, 0);
+  sc.clearRect(0, 0, stageCv.width, stageCv.height);
+
+  const viewport = page.getViewport({ scale: sWant * dpr });
   const task = page.render({
-    canvasContext: ctx,
+    canvasContext: sc,
     viewport,
-    transform: [1, 0, 0, 1, -tx * dpr, -ty * dpr],
+    transform: [1, 0, 0, 1, -txWant * dpr, -tyWant * dpr],
     intent: 'display',
   });
   renderTask = task;
   const t0 = performance.now();
   try {
     await task.promise;
+    if (pageWant !== pageNum) return;          // page changed while rendering
     lastRenderMs = performance.now() - t0;
-    rendered = { s, tx, ty, page: pageNum };
+
+    // single atomic swap: on-screen canvas is never cleared/progressively filled
+    ensureCanvas(dpr);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(stageCv, 0, 0);
+    rendered = { s: sWant, tx: txWant, ty: tyWant, page: pageWant };
     canvas.style.transform = 'none';
+
     const off = document.createElement('canvas');
-    off.width = canvas.width; off.height = canvas.height;
-    off.getContext('2d').drawImage(canvas, 0, 0);
-    cachePut(frameCache, `${pageNum}@${s.toFixed(3)}`, { cv: off, s, tx, ty, dpr, page: pageNum }, CACHE_MAX);
+    off.width = stageCv.width; off.height = stageCv.height;
+    off.getContext('2d').drawImage(stageCv, 0, 0);
+    cachePut(frameCache, `${pageWant}@${sWant.toFixed(3)}`,
+      { cv: off, s: sWant, tx: txWant, ty: tyWant, dpr, page: pageWant }, CACHE_MAX);
     updateHud();
     primeNeighbours();
+    scheduleSnap();
+    saveLastPos(pageWant);        // remember zoom + position, not just the page
   } catch (err) {
     if (err && err.name !== 'RenderingCancelledException') console.warn(err);
   } finally {
@@ -234,26 +261,23 @@ async function renderHi() {
   }
 }
 
-/* --- public render: instant from cache, then sharpen --- */
+/* --- public render: keep the picture on screen, sharpen behind it --- */
 
 async function render({ immediate = false } = {}) {
   if (!page) return;
   rafPending = false;
 
-  const f = bestFrame();
-  if (f && !(f.dpr >= hiDpr() * 0.98 && Math.abs(f.s - s) < 1e-6 && Math.abs(f.tx - tx) < 0.5 && Math.abs(f.ty - ty) < 0.5)) {
-    blitFrame(f);          // instant, may be a touch soft
-    updateHud();
-  } else if (f) {
-    blitFrame(f);          // already exact — nothing to do
-    updateHud();
-    primeNeighbours();
-    return;
+  // Only repaint from cache when the current picture is useless for this view
+  // (page changed, or the zoom jumped so far the stretch would look broken).
+  const ratio = rendered.s / s;
+  const tooFar = rendered.page !== pageNum || ratio > 3 || ratio < 1 / 3;
+  if (tooFar) {
+    const f = bestFrame();
+    if (f) { blitFrame(f); updateHud(); }
   }
 
   clearTimeout(hiTimer);
-  const delay = immediate ? 0 : (f ? 40 : 0);
-  hiTimer = setTimeout(() => { renderHi(); }, delay);
+  hiTimer = setTimeout(renderHi, immediate || tooFar ? 0 : 40);
 }
 
 function scheduleRender() {
@@ -413,6 +437,8 @@ stage.addEventListener('wheel', (e) => {
 async function openPdf(data, name) {
   spinner.hidden = false;
   emptyEl.hidden = true;
+  // pdf.js TRANSFERS the buffer to its worker, so keep a copy for IndexedDB first
+  const keep = data.slice(0);
   try {
     const doc = await pdfjsLib.getDocument({
       data,
@@ -428,7 +454,7 @@ async function openPdf(data, name) {
     pgLabel.hidden = false; fitBtn.hidden = false;
     lastFile = { name: name || 'document.pdf' };
     if (typeof refreshInstallUI === 'function') refreshInstallUI();
-    await saveLast(data, lastFile.name);
+    await saveLast(keep, lastFile.name);
     showChrome();
   } catch (err) {
     console.error(err);
@@ -662,7 +688,7 @@ async function restoreLast() {
     const db = await idb();
     const req = db.transaction('kv', 'readonly').objectStore('kv').get('last');
     const val = await new Promise((res) => { req.onsuccess = () => res(req.result); req.onerror = () => res(null); });
-    if (!val || !val.blob) return false;
+    if (!val || !val.blob || !val.blob.size) return false;
     const buf = await val.blob.arrayBuffer();
     const doc = await pdfjsLib.getDocument({
       data: new Uint8Array(buf),
@@ -689,6 +715,62 @@ async function restoreLast() {
     console.warn('restore failed', e);
     return false;
   }
+}
+
+/* ---------------- instant first paint (snapshot) ---------------- */
+
+async function idbGet(key) {
+  try {
+    const db = await idb();
+    const req = db.transaction('kv', 'readonly').objectStore('kv').get(key);
+    return await new Promise((res) => { req.onsuccess = () => res(req.result || null); req.onerror = () => res(null); });
+  } catch { return null; }
+}
+
+async function idbPut(key, value) {
+  try {
+    const db = await idb();
+    db.transaction('kv', 'readwrite').objectStore('kv').put(value, key);
+  } catch { /* ignore */ }
+}
+
+let snapTimer = null;
+function scheduleSnap() {
+  clearTimeout(snapTimer);
+  snapTimer = setTimeout(saveSnap, 700);
+}
+
+async function saveSnap() {
+  if (!pdf || !page) return;
+  try {
+    const w = 660, h = Math.max(1, Math.round(w * ch / cw));
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    c.getContext('2d').drawImage(canvas, 0, 0, w, h);
+    const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.72));
+    if (!blob) return;
+    await idbPut('snap', { blob, page: pageNum, s, tx, ty, ratio: s / fitScale });
+  } catch { /* ignore */ }
+}
+
+async function showSnapFirst() {
+  const rec = await idbGet('snap');
+  if (!rec || !rec.blob) return false;
+  try {
+    const bmp = await createImageBitmap(rec.blob);
+    const dpr = hiDpr();
+    ensureCanvas(dpr);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    canvas.style.transform = 'none';
+    rendered = { s: rec.s || 1, tx: rec.tx || 0, ty: rec.ty || 0, page: rec.page || 1 };
+    emptyEl.hidden = true;
+    topEl.hidden = false; bottomEl.hidden = false;
+    pgLabel.hidden = false; fitBtn.hidden = false;
+    pgLabel.textContent = `${rec.page || 1} / …`;
+    return true;
+  } catch { return false; }
 }
 
 /* ---------------- share target ---------------- */
@@ -742,8 +824,9 @@ async function tryShared() {
       }
     } catch (e) { console.warn('url open failed', e); }
   }
+  await showSnapFirst();          // instant picture while the file is read
   const ok = await restoreLast();
-  if (!ok) emptyEl.hidden = false;
+  if (!ok && emptyEl.hidden === false) emptyEl.hidden = false;
   // always give an install entry point (native prompt when available, steps otherwise)
   setTimeout(() => { showInstallPill(); }, 700);
 })();
