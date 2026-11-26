@@ -355,13 +355,13 @@ async function renderHi() {
 
 let panRaf = false;
 function schedulePaint() {
-  // used during gestures: repaint from cache on the next frame (image-like pan/zoom)
+  // During a gesture, let the browser compositor transform the last painted
+  // canvas. Avoid repeated drawImage/clearRect work on every pointer frame.
   if (panRaf) return;
   panRaf = true;
   requestAnimationFrame(() => {
     panRaf = false;
-    const f = bestFrame();
-    if (f) blitFrame(f); else applyTransient();
+    applyTransient();
   });
 }
 
@@ -384,9 +384,11 @@ async function render({ immediate = false } = {}) {
   }
 
   clearTimeout(hiTimer);
+  // A short idle window coalesces several quick pinch/pan adjustments
+  // into one raster pass instead of repeatedly starting expensive renders.
   hiTimer = setTimeout(() => {
     if (!gestureActive && generation === documentGeneration && pageWant === pageNum) renderHi();
-  }, f ? 60 : 0);
+  }, f ? 110 : 70);
 }
 
 function scheduleRender() {
@@ -606,8 +608,14 @@ async function loadPage(n, { keepView = true } = {}) {
   pageNum = n;
   if (!keepView) { fitWidth(); }
   else { fitWidth(true); }
-  const prev = previewCache.get(n);
-  if (prev) { blitFrame(prev); updateHud(); }   // instant page paint
+  let prev = previewCache.get(n);
+  if (!prev) {
+    // Paint a lightweight whole-page preview first; refine it to full quality
+    // after the page is already visible.
+    try { prev = await ensurePreview(n); } catch {}
+    if (doc !== pdf || generation !== documentGeneration || requestId !== pageRequestId) return;
+  }
+  if (prev) { blitFrame(prev); updateHud(); }
   await render({ immediate: !prev });
   saveLastPos(n);
 }
