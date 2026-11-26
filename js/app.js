@@ -33,6 +33,8 @@ let cw = 0, ch = 0;
 let fitScale = 1;
 
 let renderTask = null;
+let primeGeneration = 0;
+let lastRenderMs = 0;
 let rafPending = false;
 let gestureActive = false;
 let lastFile = null;
@@ -161,6 +163,8 @@ function tileScale() {
   return Math.pow(2, Math.round(Math.log2(Math.max(s, 0.001)) * 4) / 4);
 }
 
+function hiDpr() { return tileDpr(); }
+
 function tileDpr() {
   return Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
 }
@@ -261,7 +265,10 @@ function blitFrame(f) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(f.cv, 0, 0, canvas.width, canvas.height);
+  const v = viewPts();
+  const sx = v.x0 * f.s, sy = v.y0 * f.s;
+  const sw = v.w * f.s, sh = v.h * f.s;
+  ctx.drawImage(f.cv, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
   rendered = { s, tx, ty, page: pageNum };
   canvas.style.transform = 'none';
 }
@@ -758,12 +765,12 @@ window.__pz = {
   pan: (dx, dy) => { tx -= dx; ty -= dy; clampView(); render(); },
   zoomAt, fit: () => { fitWidth(); render(); }, nextPage, prevPage,
   install: { hasPrompt: () => !!deferredPrompt, fab: () => !installFab.hidden, standalone: isStandalone, sheet: () => openSheet() },
-  perf: () => ({ lastRenderMs: Math.round(lastRenderMs), frames: frameCache.size, previews: previewCache.size, hiDpr: +hiDpr().toFixed(2) }),
+  perf: () => ({ tileCacheMB: +(tileBytes / 1048576).toFixed(1), tiles: tileCache.size, previews: previewCache.size, tileScale: +currentTileBucket.toFixed(3), dpr: +hiDpr().toFixed(2) }),
   zoom: (f) => { zoomAt(cw / 2, ch / 2, f); render(); },
   zoomTo: (target) => { zoomTo(target); render(); },
 
-  prime: () => primeNeighbours(),
-  dbg: { renderHi, render, bestFrame, page: () => page, previews: () => [...previewCache.keys()], frames: () => [...frameCache.keys()] },
+  prime: () => render(),
+  dbg: { render, page: () => page, previews: () => [...previewCache.keys()], tiles: () => [...tileCache.keys()] },
 };
 
 /* drag & drop (desktop) */
