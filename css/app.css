@@ -146,6 +146,12 @@ body.hide-chrome #top > *, body.hide-chrome #bottom > * { pointer-events: none; 
 }
 body.hide-chrome #installFab { opacity: .0; pointer-events: none; }
 
+#installInline {
+  color: var(--muted); font-size: 13.5px;
+  text-decoration: underline; text-underline-offset: 3px;
+  padding: 4px 8px;
+}
+
 #sheet {
   position: fixed; inset: 0; z-index: 60;
   background: rgba(0, 0, 0, .62);

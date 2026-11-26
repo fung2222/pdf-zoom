@@ -295,6 +295,7 @@ async function openPdf(data, name) {
     topEl.hidden = false; bottomEl.hidden = false;
     pgLabel.hidden = false; fitBtn.hidden = false;
     lastFile = { name: name || 'document.pdf' };
+    if (typeof refreshInstallUI === 'function') refreshInstallUI();
     await saveLast(data, lastFile.name);
     showChrome();
   } catch (err) {
@@ -377,9 +378,17 @@ const isStandalone = () =>
 const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
+const installInline = document.getElementById('installInline');
+
+function refreshInstallUI() {
+  const standalone = isStandalone();
+  const emptyShown = !emptyEl.hidden;
+  installFab.hidden = standalone || emptyShown;      // floating pill only while reading
+  installInline.hidden = standalone || !emptyShown;  // inline link on the empty screen
+}
+
 function showInstallPill() {
-  if (isStandalone()) return;
-  installFab.hidden = false;
+  refreshInstallUI();
 }
 
 function manualSteps() {
@@ -420,18 +429,22 @@ window.addEventListener('appinstalled', () => {
   sheet.hidden = true;
 });
 
-installFab.addEventListener('click', async () => {
+async function handleInstallClick() {
   if (deferredPrompt) {
     try {
       deferredPrompt.prompt();
       const choice = await deferredPrompt.userChoice;
       deferredPrompt = null;
-      if (choice && choice.outcome === 'accepted') installFab.hidden = true;
+      if (choice && choice.outcome === 'accepted') { installFab.hidden = true; installInline.hidden = true; }
+      refreshInstallUI();
       return;
     } catch (err) { /* fall through to instructions */ }
   }
   openSheet();
-});
+}
+
+installFab.addEventListener('click', handleInstallClick);
+installInline.addEventListener('click', handleInstallClick);
 
 /* debug/automation hook (harmless in production) */
 window.__pz = {
@@ -513,6 +526,7 @@ async function restoreLast() {
     emptyEl.hidden = true;
     lastFile = { name: val.name };
     await render();
+    if (typeof refreshInstallUI === 'function') refreshInstallUI();
     showChrome();
     return true;
   } catch (e) {
