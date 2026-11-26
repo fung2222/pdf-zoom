@@ -359,11 +359,86 @@ window.addEventListener('keydown', (e) => {
   if (e.key === '0') { fitWidth(); render(); }
 });
 
+/* ---------------- install to home screen ---------------- */
+
+const installFab = document.getElementById('installFab');
+const sheet = document.getElementById('sheet');
+const sheetTitle = document.getElementById('sheetTitle');
+const sheetSteps = document.getElementById('sheetSteps');
+const sheetClose = document.getElementById('sheetClose');
+
+let deferredPrompt = null;
+
+const isStandalone = () =>
+  window.matchMedia('(display-mode: standalone)').matches ||
+  window.matchMedia('(display-mode: fullscreen)').matches ||
+  window.navigator.standalone === true;
+
+const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+function showInstallPill() {
+  if (isStandalone()) return;
+  installFab.hidden = false;
+}
+
+function manualSteps() {
+  if (isIOS()) {
+    return { title: '加到主畫面（iPhone）', steps: [
+      '撳下面 Safari 個「分享」圖示（正方框＋向上箭頭）',
+      '揀「加入主畫面」',
+      '右上撳「加入」',
+      '主畫面就會出現 PDF 圖示',
+    ] };
+  }
+  return { title: '加到主畫面（Android）', steps: [
+    '要喺 Chrome 開呢個網頁（唔好用 Telegram／IG 內建瀏覽器）',
+    '撳 Chrome 右上 ⋮',
+    '揀「安裝應用程式」（舊版叫「加到主畫面」）',
+    '再撳「安裝」',
+  ] };
+}
+
+function openSheet() {
+  const m = manualSteps();
+  sheetTitle.textContent = m.title;
+  sheetSteps.innerHTML = m.steps.map((s) => `<li>${s}</li>`).join('');
+  sheet.hidden = false;
+}
+sheetClose.addEventListener('click', () => { sheet.hidden = true; showChrome(); });
+sheet.addEventListener('click', (e) => { if (e.target === sheet) sheet.hidden = true; });
+
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredPrompt = e;
+  showInstallPill();
+});
+
+window.addEventListener('appinstalled', () => {
+  deferredPrompt = null;
+  installFab.hidden = true;
+  sheet.hidden = true;
+});
+
+installFab.addEventListener('click', async () => {
+  if (deferredPrompt) {
+    try {
+      deferredPrompt.prompt();
+      const choice = await deferredPrompt.userChoice;
+      deferredPrompt = null;
+      if (choice && choice.outcome === 'accepted') installFab.hidden = true;
+      return;
+    } catch (err) { /* fall through to instructions */ }
+  }
+  openSheet();
+});
+
 /* debug/automation hook (harmless in production) */
 window.__pz = {
   state: () => ({ s, tx, ty, fitScale, pageNum, pageCount, cw, ch }),
   pan: (dx, dy) => { tx -= dx; ty -= dy; clampView(); render(); },
   zoomAt, fit: () => { fitWidth(); render(); }, nextPage, prevPage,
+  install: { hasPrompt: () => !!deferredPrompt, fab: () => !installFab.hidden, standalone: isStandalone, sheet: () => openSheet() },
 };
 
 /* drag & drop (desktop) */
@@ -490,4 +565,6 @@ async function tryShared() {
   }
   const ok = await restoreLast();
   if (!ok) emptyEl.hidden = false;
+  // always give an install entry point (native prompt when available, steps otherwise)
+  setTimeout(() => { showInstallPill(); }, 700);
 })();
