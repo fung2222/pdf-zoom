@@ -94,19 +94,27 @@ function zoomTo(nextS, clientX = cw / 2, clientY = ch / 2) {
   zoomAt(clientX, clientY, nextS / s);
 }
 
-/* ---------------- rendering: overscan frames + atomic swap ---------------- */
+/* ---------------- rendering: cached PDF tiles ---------------- */
 
-const MAX_PIXELS = 6.2e6;   // device-pixel budget for one rendered frame
-const RATIO_CAP = 2;        // above 2x device pixels extra work is invisible
-const OVERSCAN = 1.7;       // render this much bigger than the viewport so panning needs no reload
-const CACHE_MAX = 3;
-const PREVIEW_MAX = 3;
+const TILE_SIZE = 512;                 // CSS pixels per tile at its render scale
+const TILE_CACHE_BYTES = 64 * 1024 * 1024;
+const TILE_CONCURRENCY = 2;
 const MAX_PREVIEW_PIXELS = 1.2e6;
-
-// frame = { cv, s, dpr, page, x0, y0, w, h }   (x0/y0/w/h in PDF points)
-const frameCache = new Map();
 const previewCache = new Map();
-let stageCv = null, stageCtx = null;
+const tileCache = new Map();
+let tileBytes = 0;
+let tileLayer = document.createElement('div');
+tileLayer.id = 'tileLayer';
+tileLayer.style.cssText = 'position:absolute;inset:0;overflow:visible;pointer-events:none;transform-origin:0 0;will-change:transform;z-index:1;';
+stage.insertBefore(tileLayer, canvas.nextSibling);
+
+let activeTileTasks = new Set();
+let tileQueue = [];
+let tileWorkers = 0;
+let wantedTileKeys = new Set();
+let currentTileBucket = 0;
+let currentTileDpr = 1;
+let tileEpoch = 0;
 
 function releaseFrame(frame) {
   if (!frame || !frame.cv) return;
@@ -114,11 +122,15 @@ function releaseFrame(frame) {
 }
 
 function clearRenderCaches() {
-  for (const frame of frameCache.values()) releaseFrame(frame);
   for (const frame of previewCache.values()) releaseFrame(frame);
-  frameCache.clear();
   previewCache.clear();
-  if (stageCv) { stageCv.width = 0; stageCv.height = 0; }
+  for (const tile of tileCache.values()) releaseTile(tile);
+  tileCache.clear();
+  tileBytes = 0;
+  tileQueue = [];
+  wantedTileKeys.clear();
+  tileEpoch++;
+  tileLayer.replaceChildren();
   if (canvas) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -126,38 +138,43 @@ function clearRenderCaches() {
   }
 }
 
+function releaseTile(tile) {
+  if (!tile || !tile.cv) return;
+  tileBytes = Math.max(0, tileBytes - (tile.bytes || 0));
+  try { tile.cv.width = 0; tile.cv.height = 0; } catch {}
+}
+
 function cancelHiRender() {
   clearTimeout(hiTimer);
   renderGeneration++;
-  if (renderTask) {
-    try { renderTask.cancel(); } catch {}
-    renderTask = null;
+  tileEpoch++;
+  for (const task of activeTileTasks) {
+    try { task.cancel(); } catch {}
   }
+  activeTileTasks.clear();
+  tileQueue = [];
 }
 let hiTimer = null;
-let lastRenderMs = 0;
 
-function hiDpr() {
-  let d = Math.min(DPR(), RATIO_CAP);
-  if (cw * ch * d * d > MAX_PIXELS) d = Math.sqrt(MAX_PIXELS / (cw * ch));
-  return Math.max(1, d);
+function tileScale() {
+  // Quantized scale avoids rerendering for tiny pinch fluctuations.
+  return Math.pow(2, Math.round(Math.log2(Math.max(s, 0.001)) * 4) / 4);
+}
+
+function tileDpr() {
+  return Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
 }
 
 function viewPts() {
   return { x0: tx / s, y0: ty / s, w: cw / s, h: ch / s };
 }
 
-function covers(f, v, tol = 1) {
-  return v.x0 >= f.x0 - tol && v.y0 >= f.y0 - tol &&
-         v.x0 + v.w <= f.x0 + f.w + tol && v.y0 + v.h <= f.y0 + f.h + tol;
-}
-
 function applyTransient() {
-  // last-resort gesture feedback when no cached frame covers the view
   const k = s / rendered.s;
   const dx = rendered.tx * k - tx;
   const dy = rendered.ty * k - ty;
   canvas.style.transform = `translate(${dx}px, ${dy}px) scale(${k})`;
+  tileLayer.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`;
 }
 
 function ensureCanvas(dpr) {
@@ -167,62 +184,41 @@ function ensureCanvas(dpr) {
   canvas.style.height = ch + 'px';
 }
 
-function ensureStage(w, h) {
-  if (!stageCv) {
-    stageCv = document.createElement('canvas');
-    stageCtx = stageCv.getContext('2d', { alpha: true });
-  }
-  if (stageCv.width !== w || stageCv.height !== h) { stageCv.width = w; stageCv.height = h; }
-  return stageCtx;
-}
-
-function cachePut(map, key, frame, max) {
-  const previous = map.get(key);
-  if (previous && previous !== frame) releaseFrame(previous);
-  map.delete(key);
-  map.set(key, frame);
-  while (map.size > max) {
-    const oldestKey = map.keys().next().value;
-    const oldest = map.get(oldestKey);
-    map.delete(oldestKey);
-    releaseFrame(oldest);
+function cachePreview(n, frame) {
+  const old = previewCache.get(n);
+  if (old && old !== frame) releaseFrame(old);
+  previewCache.delete(n);
+  previewCache.set(n, frame);
+  while (previewCache.size > 3) {
+    const key = previewCache.keys().next().value;
+    releaseFrame(previewCache.get(key));
+    previewCache.delete(key);
   }
 }
 
-/* --- paint whatever is cached for this view (instant, no re-render) --- */
-
-function bestFrame() {
-  const v = viewPts();
-  let best = null, bestScore = -1;
-  for (const f of frameCache.values()) {
-    if (f.page !== pageNum || !covers(f, v)) continue;
-    const sharp = Math.min(f.s / s, 1);
-    const score = sharp * 1000 - Math.abs(Math.log(f.s / s)) * 20;
-    if (score > bestScore) { bestScore = score; best = f; }
+function cacheTile(key, tile) {
+  const old = tileCache.get(key);
+  if (old) releaseTile(old);
+  tileCache.delete(key);
+  tileCache.set(key, tile);
+  tileBytes += tile.bytes;
+  while (tileBytes > TILE_CACHE_BYTES && tileCache.size > 1) {
+    const oldestKey = tileCache.keys().next().value;
+    const oldest = tileCache.get(oldestKey);
+    tileCache.delete(oldestKey);
+    if (oldest.cv.parentNode) oldest.cv.remove();
+    releaseTile(oldest);
   }
-  if (best) return best;
-  const p = previewCache.get(pageNum);
-  if (p && covers(p, v)) return p;
-  return null;
 }
 
-function blitFrame(f) {
-  const v = viewPts();
-  const sx = (v.x0 - f.x0) * f.s * f.dpr;
-  const sy = (v.y0 - f.y0) * f.s * f.dpr;
-  const sw = v.w * f.s * f.dpr;
-  const sh = v.h * f.s * f.dpr;
-  ensureCanvas(f.dpr);
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(f.cv, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
-  rendered = { s, tx, ty, page: pageNum };
-  canvas.style.transform = 'none';
+function touchTile(key, tile) {
+  tileCache.delete(key);
+  tileCache.set(key, tile);
 }
 
-/* --- low-res whole-page preview (page flips, far pans) --- */
+function tileKey(pageNo, bucket, dpr, ix, iy) {
+  return `${documentGeneration}:${pageNo}:${bucket.toFixed(4)}:${dpr}:${ix}:${iy}`;
+}
 
 async function ensurePreview(n) {
   if (previewCache.has(n)) return previewCache.get(n);
@@ -234,18 +230,20 @@ async function ensurePreview(n) {
   try { p = wasCurrentPage ? currentPageRef : await doc.getPage(n); } catch { return null; }
   if (!doc || doc !== pdf || generation !== documentGeneration ||
       (wasCurrentPage && (pageNum !== n || page !== currentPageRef))) return null;
-  const pw = p.view[2] - p.view[0], ph = p.view[3] - p.view[1];
+  const vp1 = p.getViewport({ scale: 1 });
+  const pw = vp1.width, ph = vp1.height;
   const targetWidth = Math.min(1000, Math.max(640, cw * 1.2));
   const ps = Math.min(targetWidth / pw, Math.sqrt(MAX_PREVIEW_PIXELS / (pw * ph)));
   const vp = p.getViewport({ scale: ps });
   const off = document.createElement('canvas');
-  off.width = Math.round(vp.width);
-  off.height = Math.round(vp.height);
+  off.width = Math.max(1, Math.round(vp.width));
+  off.height = Math.max(1, Math.round(vp.height));
   try {
     await p.render({ canvasContext: off.getContext('2d'), viewport: vp }).promise;
   } catch (err) {
     off.width = 0; off.height = 0;
-    throw err;
+    if (err && err.name !== 'RenderingCancelledException') throw err;
+    return null;
   }
   if (doc !== pdf || generation !== documentGeneration ||
       (wasCurrentPage && (pageNum !== n || page !== currentPageRef))) {
@@ -253,112 +251,129 @@ async function ensurePreview(n) {
     return null;
   }
   const frame = { cv: off, s: ps, dpr: 1, page: n, x0: 0, y0: 0, w: pw, h: ph };
-  cachePut(previewCache, n, frame, PREVIEW_MAX);
+  cachePreview(n, frame);
   return frame;
 }
 
-let primeGeneration = 0;
-function primeNeighbours() {
-  if (gestureActive || !pdf) return;
-  const jobs = [pageNum + 1, pageNum - 1, pageNum + 2]
-    .filter((n) => n >= 1 && n <= pageCount && !previewCache.has(n));
-  if (!jobs.length) return;
-  const generation = documentGeneration;
-  const primeId = ++primeGeneration;
-  const run = async () => {
-    for (const n of jobs) {
-      if (generation !== documentGeneration || primeId !== primeGeneration || gestureActive) return;
-      try { await ensurePreview(n); } catch {}
-    }
-  };
-  if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 1500 }); else setTimeout(run, 300);
+function blitFrame(f) {
+  ensureCanvas(1);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(f.cv, 0, 0, canvas.width, canvas.height);
+  rendered = { s, tx, ty, page: pageNum };
+  canvas.style.transform = 'none';
 }
 
-/* --- hi-res render of an overscanned region, swapped in atomically --- */
-
-async function renderHi() {
-  if (!page || gestureActive) return;
-  if (renderTask) { try { renderTask.cancel(); } catch {} }
-  renderTask = null;
-  const generation = documentGeneration;
-  const renderId = ++renderGeneration;
-  const pageRef = page;
-
-  const dpr = hiDpr();
-  const pw = page.view[2] - page.view[0], ph = page.view[3] - page.view[1];
-  const v = viewPts();
-  const sWant = s, txWant = tx, tyWant = ty, pageWant = pageNum;
-
-  // region to render: overscan around the viewport, clamped to the page and to the pixel budget
-  let fw = Math.min(pw, v.w * OVERSCAN);
-  let fh = Math.min(ph, v.h * OVERSCAN);
-  const maxAreaPt = MAX_PIXELS / (sWant * sWant * dpr * dpr);
-  if (fw * fh > maxAreaPt) {
-    const k = Math.sqrt(maxAreaPt / (fw * fh));
-    fw = Math.max(v.w, fw * k);
-    fh = Math.max(v.h, fh * k);
+function trimTileCache() {
+  while (tileBytes > TILE_CACHE_BYTES && tileCache.size > 1) {
+    const key = tileCache.keys().next().value;
+    const tile = tileCache.get(key);
+    tileCache.delete(key);
+    if (tile.cv.parentNode) tile.cv.remove();
+    releaseTile(tile);
   }
-  let fx0 = v.x0 - (fw - v.w) / 2;
-  let fy0 = v.y0 - (fh - v.h) / 2;
-  fx0 = Math.max(0, Math.min(pw - fw, fx0));
-  fy0 = Math.max(0, Math.min(ph - fh, fy0));
-  if (fx0 > v.x0) { fx0 = v.x0; fw = Math.min(pw, fw + (v.x0 - fx0)); }
-  if (fy0 > v.y0) { fy0 = v.y0; fh = Math.min(ph, fh + (v.y0 - fy0)); }
+}
 
-  const wPx = Math.max(1, Math.round(fw * sWant * dpr));
-  const hPx = Math.max(1, Math.round(fh * sWant * dpr));
-  const sc = ensureStage(wPx, hPx);
-  sc.setTransform(1, 0, 0, 1, 0, 0);
-  sc.clearRect(0, 0, wPx, hPx);
+function paintWantedTiles() {
+  const v = viewPts();
+  const bucket = currentTileBucket;
+  const dpr = currentTileDpr;
+  const tilePageSize = TILE_SIZE / bucket;
+  const maxX = Math.max(0, Math.ceil((page.getViewport({scale:1}).width * bucket) / TILE_SIZE) - 1);
+  const maxY = Math.max(0, Math.ceil((page.getViewport({scale:1}).height * bucket) / TILE_SIZE) - 1);
+  const x0 = Math.max(0, Math.floor(v.x0 / tilePageSize) - 1);
+  const y0 = Math.max(0, Math.floor(v.y0 / tilePageSize) - 1);
+  const x1 = Math.min(maxX, Math.floor((v.x0 + v.w) / tilePageSize) + 1);
+  const y1 = Math.min(maxY, Math.floor((v.y0 + v.h) / tilePageSize) + 1);
+  const desired = [];
+  for (let iy=y0; iy<=y1; iy++) {
+    for (let ix=x0; ix<=x1; ix++) {
+      const key = tileKey(pageNum, bucket, dpr, ix, iy);
+      desired.push({key, ix, iy, distance: Math.hypot((ix+.5)*tilePageSize-(v.x0+v.w/2), (iy+.5)*tilePageSize-(v.y0+v.h/2))});
+    }
+  }
+  desired.sort((a,b)=>a.distance-b.distance);
+  wantedTileKeys = new Set(desired.map(t=>t.key));
+  tileLayer.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`;
+  const keep = new Set();
+  for (const item of desired) {
+    let tile = tileCache.get(item.key);
+    if (tile) {
+      touchTile(item.key, tile);
+      tile.cv.style.display = '';
+      if (tile.cv.parentNode !== tileLayer) tileLayer.appendChild(tile.cv);
+      keep.add(item.key);
+    } else {
+      enqueueTile(item);
+    }
+  }
+  for (const child of [...tileLayer.children]) {
+    if (![...keep].some(key => tileCache.get(key)?.cv === child)) child.remove();
+  }
+  pumpTileQueue();
+}
 
-  const viewport = page.getViewport({ scale: sWant * dpr });
-  const task = page.render({
-    canvasContext: sc,
+function enqueueTile(item) {
+  if (tileQueue.some(job => job.key === item.key) || tileCache.has(item.key)) return;
+  tileQueue.push({...item, epoch: tileEpoch, generation: documentGeneration, pageNo: pageNum, bucket: currentTileBucket, dpr: currentTileDpr});
+  tileQueue.sort((a,b)=>a.distance-b.distance);
+}
+
+function pumpTileQueue() {
+  while (tileWorkers < TILE_CONCURRENCY && tileQueue.length) {
+    const job = tileQueue.shift();
+    if (job.generation !== documentGeneration || job.pageNo !== pageNum || job.epoch !== tileEpoch || !wantedTileKeys.has(job.key)) continue;
+    tileWorkers++;
+    renderTile(job).finally(() => {
+      tileWorkers--;
+      pumpTileQueue();
+    });
+  }
+}
+
+async function renderTile(job) {
+  const doc = pdf, pageRef = page;
+  if (!doc || !pageRef || job.generation !== documentGeneration) return;
+  const viewport1 = pageRef.getViewport({scale:1});
+  const tilePageSize = TILE_SIZE / job.bucket;
+  const x0 = job.ix * tilePageSize, y0 = job.iy * tilePageSize;
+  const w = Math.min(tilePageSize, viewport1.width - x0);
+  const h = Math.min(tilePageSize, viewport1.height - y0);
+  if (w <= 0 || h <= 0) return;
+  const pixelW = Math.max(1, Math.ceil(w * job.bucket * job.dpr));
+  const pixelH = Math.max(1, Math.ceil(h * job.bucket * job.dpr));
+  const cv = document.createElement('canvas');
+  cv.width = pixelW; cv.height = pixelH;
+  cv.style.cssText = `position:absolute;left:${x0}px;top:${y0}px;width:${w}px;height:${h}px;max-width:none;max-height:none;`;
+  const viewport = pageRef.getViewport({scale:job.bucket * job.dpr});
+  const task = pageRef.render({
+    canvasContext: cv.getContext('2d', {alpha:false}),
     viewport,
-    transform: [1, 0, 0, 1, -fx0 * sWant * dpr, -fy0 * sWant * dpr],
+    transform: [1,0,0,1,-x0*job.bucket*job.dpr,-y0*job.bucket*job.dpr],
     intent: 'display',
   });
-  renderTask = task;
-  const t0 = performance.now();
+  activeTileTasks.add(task);
   try {
     await task.promise;
-    if (generation !== documentGeneration || renderId !== renderGeneration ||
-        pageRef !== page || pageWant !== pageNum || gestureActive) return;
-    lastRenderMs = performance.now() - t0;
-
-    // atomic swap: the on-screen canvas is never cleared while painting
-    ensureCanvas(dpr);
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const sx = (v.x0 - fx0) * sWant * dpr;
-    const sy = (v.y0 - fy0) * sWant * dpr;
-    ctx.drawImage(stageCv, sx, sy, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
-    rendered = { s: sWant, tx: txWant, ty: tyWant, page: pageWant };
-    canvas.style.transform = 'none';
-
-    const off = document.createElement('canvas');
-    off.width = wPx; off.height = hPx;
-    off.getContext('2d').drawImage(stageCv, 0, 0);
-    cachePut(frameCache, `${pageWant}@${sWant.toFixed(3)}@${Math.round(fx0)},${Math.round(fy0)}`,
-      { cv: off, s: sWant, dpr, page: pageWant, x0: fx0, y0: fy0, w: fw, h: fh }, CACHE_MAX);
-
-    updateHud();
-    primeNeighbours();
-    scheduleSnap();
-    saveLastPos(pageWant);
+    if (doc !== pdf || pageRef !== page || job.generation !== documentGeneration || job.pageNo !== pageNum) {
+      cv.width=0; cv.height=0; return;
+    }
+    const tile = {cv, bytes: pixelW*pixelH*4, key:job.key};
+    cacheTile(job.key, tile);
+    if (wantedTileKeys.has(job.key) && job.bucket === currentTileBucket && job.dpr === currentTileDpr) {
+      tileLayer.appendChild(cv);
+    }
   } catch (err) {
-    if (err && err.name !== 'RenderingCancelledException') console.warn(err);
+    cv.width=0; cv.height=0;
+    if (err && err.name !== 'RenderingCancelledException') console.warn('Tile render failed', err);
   } finally {
-    if (renderTask === task) renderTask = null;
+    activeTileTasks.delete(task);
   }
 }
 
-/* --- public render: paint from cache; only re-render when truly needed --- */
-
-let panRaf = false;
 function schedulePaint() {
-  // During a gesture, let the browser compositor transform the last painted
-  // canvas. Avoid repeated drawImage/clearRect work on every pointer frame.
   if (panRaf) return;
   panRaf = true;
   requestAnimationFrame(() => {
@@ -367,30 +382,15 @@ function schedulePaint() {
   });
 }
 
-async function render({ immediate = false } = {}) {
+async function render() {
   if (!page) return;
   rafPending = false;
-  if (gestureActive) {
-    schedulePaint();
-    return;
-  }
-
-  const generation = documentGeneration;
-  const pageWant = pageNum;
-  const f = bestFrame();
-  if (f) {
-    const sharpEnough = Math.abs(f.s - s) < 1e-9 && f.dpr >= hiDpr() * 0.98;
-    blitFrame(f);
-    updateHud();
-    if (sharpEnough) { primeNeighbours(); return; }   // panning inside an overscan frame: zero work
-  }
-
-  clearTimeout(hiTimer);
-  // A short idle window coalesces several quick pinch/pan adjustments
-  // into one raster pass instead of repeatedly starting expensive renders.
-  hiTimer = setTimeout(() => {
-    if (!gestureActive && generation === documentGeneration && pageWant === pageNum) renderHi();
-  }, f ? 110 : 70);
+  if (gestureActive) { schedulePaint(); return; }
+  currentTileBucket = tileScale();
+  currentTileDpr = tileDpr();
+  paintWantedTiles();
+  updateHud();
+  saveLastPos(pageNum);
 }
 
 function scheduleRender() {
