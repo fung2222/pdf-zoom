@@ -547,7 +547,16 @@ async function tryShared() {
 (async function boot() {
   resize();
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
+    const hadController = !!navigator.serviceWorker.controller;
+    let refreshing = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController || refreshing) return;   // don't reload on first install
+      refreshing = true;
+      location.reload();
+    });
+    navigator.serviceWorker.register('sw.js')
+      .then((reg) => reg.update().catch(() => {}))
+      .catch(() => {});
   }
   const shared = await tryShared();
   if (shared) return;
