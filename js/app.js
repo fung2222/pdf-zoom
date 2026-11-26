@@ -91,30 +91,123 @@ function zoomTo(nextS, clientX = cw / 2, clientY = ch / 2) {
   zoomAt(clientX, clientY, nextS / s);
 }
 
-/* ---------------- rendering ---------------- */
+/* ---------------- rendering: frame cache + hi/lo passes ---------------- */
+
+const MAX_PIXELS = 8.2e6;   // pixel budget per on-screen frame (sharp enough, cheap to rasterise)
+const RATIO_CAP = 2;        // above 2x device pixels the extra work is invisible
+const CACHE_MAX = 8;
+const PREVIEW_MAX = 3;
+
+const frameCache = new Map();    // "page@s" -> {cv, s, tx, ty, dpr, ms}
+const previewCache = new Map();  // page -> {cv, s, tx:0, ty:0, dpr:1, w, h} (whole page, low res)
+let hiTimer = null;
+let lastRenderMs = 0;
+
+function hiDpr() {
+  let d = Math.min(DPR(), RATIO_CAP);
+  if (cw * ch * d * d > MAX_PIXELS) d = Math.sqrt(MAX_PIXELS / (cw * ch));
+  return Math.max(1, d);
+}
 
 function applyTransient() {
-  // map the last rendered frame onto the current view with a cheap CSS transform
+  // cheap gesture feedback: re-map the frame already on screen
   const k = s / rendered.s;
   const dx = rendered.tx * k - tx;
   const dy = rendered.ty * k - ty;
   canvas.style.transform = `translate(${dx}px, ${dy}px) scale(${k})`;
 }
 
-async function render() {
-  if (!page) return;
-  rafPending = false;
-  if (renderTask) { try { renderTask.cancel(); } catch {} renderTask = null; }
+function ensureCanvas(dpr) {
+  const w = Math.round(cw * dpr), h = Math.round(ch * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  canvas.style.width = cw + 'px';
+  canvas.style.height = ch + 'px';
+}
 
-  const dpr = DPR();
-  const viewport = page.getViewport({ scale: s * dpr });
-  if (canvas.width !== Math.round(cw * dpr) || canvas.height !== Math.round(ch * dpr)) {
-    canvas.width = Math.round(cw * dpr);
-    canvas.height = Math.round(ch * dpr);
+/* --- cache helpers --- */
+
+function cachePut(map, key, frame, max) {
+  map.set(key, frame);
+  while (map.size > max) map.delete(map.keys().next().value);
+}
+
+function coversView(f) {
+  const sx = (tx * f.s / s - f.tx) * f.dpr;
+  const sw = (cw / s) * f.s * f.dpr;
+  const sy = (ty * f.s / s - f.ty) * f.dpr;
+  const sh = (ch / s) * f.s * f.dpr;
+  return sx >= -1.5 && sy >= -1.5 &&
+         sx + sw <= f.cv.width + 1.5 && sy + sh <= f.cv.height + 1.5 &&
+         sw > 8 && sh > 8;
+}
+
+function bestFrame() {
+  const prev = previewCache.get(pageNum);
+  let best = null, bestScore = -1;
+  for (const f of frameCache.values()) {
+    if (f.page !== pageNum || !coversView(f)) continue;
+    // sharpness matters most, then how fresh the offset is
+    const sharp = Math.min(f.s / s, 1);
+    const score = sharp * 1000 - (Math.abs(f.tx - tx) + Math.abs(f.ty - ty)) * 0.02;
+    if (score > bestScore) { bestScore = score; best = f; }
   }
+  if (best) return best;
+  if (prev && coversView(prev)) return prev;
+  return null;
+}
+
+function blitFrame(f) {
+  ensureCanvas(f.dpr);
+  const sx = (tx * f.s / s - f.tx) * f.dpr;
+  const sw = (cw / s) * f.s * f.dpr;
+  const sy = (ty * f.s / s - f.ty) * f.dpr;
+  const sh = (ch / s) * f.s * f.dpr;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(f.cv, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+  rendered = { s, tx, ty, page: pageNum };
+  canvas.style.transform = 'none';
+}
 
+/* --- low-res whole-page preview (instant flips / pans) --- */
+
+async function ensurePreview(n) {
+  if (previewCache.has(n)) return previewCache.get(n);
+  let p;
+  try { p = n === pageNum ? page : await pdf.getPage(n); } catch { return null; }
+  const pw = p.view[2] - p.view[0];
+  const targetCssW = Math.min(1100, Math.max(680, cw * 1.25));
+  const ps = targetCssW / pw;
+  const vp = p.getViewport({ scale: ps });
+  const off = document.createElement('canvas');
+  off.width = Math.round(vp.width);
+  off.height = Math.round(vp.height);
+  const octx = off.getContext('2d');
+  await p.render({ canvasContext: octx, viewport: vp }).promise;
+  const frame = { cv: off, s: ps, tx: 0, ty: 0, dpr: 1, page: n };
+  cachePut(previewCache, n, frame, PREVIEW_MAX);
+  return frame;
+}
+
+function primeNeighbours() {
+  const jobs = [pageNum + 1, pageNum - 1, pageNum + 2].filter((n) => n >= 1 && n <= pageCount && !previewCache.has(n));
+  if (!jobs.length) return;
+  const run = () => { jobs.forEach((n) => ensurePreview(n).catch(() => {})); };
+  if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 1200 }); else setTimeout(run, 250);
+}
+
+/* --- hi-res viewport render --- */
+
+async function renderHi() {
+  if (!page) return;
+  if (renderTask) { try { renderTask.cancel(); } catch {} renderTask = null; }
+  const dpr = hiDpr();
+  ensureCanvas(dpr);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const viewport = page.getViewport({ scale: s * dpr });
   const task = page.render({
     canvasContext: ctx,
     viewport,
@@ -122,16 +215,45 @@ async function render() {
     intent: 'display',
   });
   renderTask = task;
+  const t0 = performance.now();
   try {
     await task.promise;
+    lastRenderMs = performance.now() - t0;
     rendered = { s, tx, ty, page: pageNum };
     canvas.style.transform = 'none';
+    const off = document.createElement('canvas');
+    off.width = canvas.width; off.height = canvas.height;
+    off.getContext('2d').drawImage(canvas, 0, 0);
+    cachePut(frameCache, `${pageNum}@${s.toFixed(3)}`, { cv: off, s, tx, ty, dpr, page: pageNum }, CACHE_MAX);
+    updateHud();
+    primeNeighbours();
   } catch (err) {
     if (err && err.name !== 'RenderingCancelledException') console.warn(err);
   } finally {
     if (renderTask === task) renderTask = null;
   }
-  updateHud();
+}
+
+/* --- public render: instant from cache, then sharpen --- */
+
+async function render({ immediate = false } = {}) {
+  if (!page) return;
+  rafPending = false;
+
+  const f = bestFrame();
+  if (f && !(f.dpr >= hiDpr() * 0.98 && Math.abs(f.s - s) < 1e-6 && Math.abs(f.tx - tx) < 0.5 && Math.abs(f.ty - ty) < 0.5)) {
+    blitFrame(f);          // instant, may be a touch soft
+    updateHud();
+  } else if (f) {
+    blitFrame(f);          // already exact — nothing to do
+    updateHud();
+    primeNeighbours();
+    return;
+  }
+
+  clearTimeout(hiTimer);
+  const delay = immediate ? 0 : (f ? 40 : 0);
+  hiTimer = setTimeout(() => { renderHi(); }, delay);
 }
 
 function scheduleRender() {
@@ -142,7 +264,7 @@ function scheduleRender() {
 
 /* ---------------- hud ---------------- */
 
-let hudTimer = null, chromeTimer = null;
+let hudTimer = null, chromeTimer = null, lastFlash = 0, zoomTimer = null;
 function updateHud() {
   if (!pdf) return;
   pgLabel.textContent = `${pageNum} / ${pageCount}`;
@@ -152,12 +274,22 @@ function updateHud() {
 }
 
 function flashZoom() {
+  const now = performance.now();
+  if (now - lastFlash < 90) { debouncedZoomLabel(); return; }   // don't thrash the DOM mid-pinch
+  lastFlash = now;
   const pct = Math.round((s / fitScale) * 100);
   badge.textContent = pct + '%';
   badge.hidden = false;
+  zoomLabel.textContent = pct + '%';
   clearTimeout(hudTimer);
   hudTimer = setTimeout(() => { badge.hidden = true; }, 900);
-  zoomLabel.textContent = pct + '%';
+}
+
+function debouncedZoomLabel() {
+  clearTimeout(zoomTimer);
+  zoomTimer = setTimeout(() => {
+    zoomLabel.textContent = Math.round((s / fitScale) * 100) + '%';
+  }, 120);
 }
 
 function showChrome() {
@@ -312,7 +444,9 @@ async function loadPage(n, { keepView = true } = {}) {
   pageNum = n;
   if (!keepView) { fitWidth(); }
   else { fitWidth(true); }
-  await render();
+  const prev = previewCache.get(n);
+  if (prev) { blitFrame(prev); updateHud(); }   // instant page paint
+  await render({ immediate: !prev });
   saveLastPos(n);
 }
 
@@ -452,6 +586,12 @@ window.__pz = {
   pan: (dx, dy) => { tx -= dx; ty -= dy; clampView(); render(); },
   zoomAt, fit: () => { fitWidth(); render(); }, nextPage, prevPage,
   install: { hasPrompt: () => !!deferredPrompt, fab: () => !installFab.hidden, standalone: isStandalone, sheet: () => openSheet() },
+  perf: () => ({ lastRenderMs: Math.round(lastRenderMs), frames: frameCache.size, previews: previewCache.size, hiDpr: +hiDpr().toFixed(2) }),
+  zoom: (f) => { zoomAt(cw / 2, ch / 2, f); render(); },
+  zoomTo: (target) => { zoomTo(target); render(); },
+
+  prime: () => primeNeighbours(),
+  dbg: { renderHi, render, bestFrame, page: () => page, previews: () => [...previewCache.keys()], frames: () => [...frameCache.keys()] },
 };
 
 /* drag & drop (desktop) */
@@ -495,11 +635,26 @@ function saveLastPos(n) {
       req.onsuccess = () => {
         const v = req.result;
         if (!v) return;
+        const { w, h } = pageSize();
         v.page = n;
+        v.view = {
+          z: fitScale ? s / fitScale : 1,
+          fx: w * s ? (tx + cw / 2) / (w * s) : 0.5,
+          fy: h * s ? (ty + ch / 2) / (h * s) : 0.5,
+        };
         store.put(v, 'last');
       };
     } catch (e) { /* ignore */ }
-  }, 400);
+  }, 350);
+}
+
+function applySavedView(view) {
+  if (!view || !view.z) return;
+  const { w, h } = pageSize();
+  s = Math.min(MAX_SCALE, Math.max(fitScale, fitScale * view.z));
+  tx = (view.fx || 0.5) * w * s - cw / 2;
+  ty = (view.fy || 0.5) * h * s - ch / 2;
+  clampView();
 }
 
 async function restoreLast() {
@@ -522,6 +677,7 @@ async function restoreLast() {
     canvas.width = Math.round(cw * dpr); canvas.height = Math.round(ch * dpr);
     canvas.style.width = cw + 'px'; canvas.style.height = ch + 'px';
     fitWidth();
+    applySavedView(val.view);
     topEl.hidden = false; bottomEl.hidden = false; pgLabel.hidden = false; fitBtn.hidden = false;
     emptyEl.hidden = true;
     lastFile = { name: val.name };
