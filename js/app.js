@@ -227,9 +227,12 @@ async function ensurePreview(n) {
   if (previewCache.has(n)) return previewCache.get(n);
   const doc = pdf;
   const generation = documentGeneration;
+  const wasCurrentPage = n === pageNum;
+  const currentPageRef = wasCurrentPage ? page : null;
   let p;
-  try { p = n === pageNum ? page : await doc.getPage(n); } catch { return null; }
-  if (!doc || doc !== pdf || generation !== documentGeneration) return null;
+  try { p = wasCurrentPage ? currentPageRef : await doc.getPage(n); } catch { return null; }
+  if (!doc || doc !== pdf || generation !== documentGeneration ||
+      (wasCurrentPage && (pageNum !== n || page !== currentPageRef))) return null;
   const pw = p.view[2] - p.view[0], ph = p.view[3] - p.view[1];
   const ps = Math.min(1000, Math.max(640, cw * 1.2)) / pw;
   const vp = p.getViewport({ scale: ps });
@@ -242,7 +245,8 @@ async function ensurePreview(n) {
     off.width = 0; off.height = 0;
     throw err;
   }
-  if (doc !== pdf || generation !== documentGeneration) {
+  if (doc !== pdf || generation !== documentGeneration ||
+      (wasCurrentPage && (pageNum !== n || page !== currentPageRef))) {
     off.width = 0; off.height = 0;
     return null;
   }
@@ -575,11 +579,13 @@ async function openPdf(data, name) {
     await saveLast(keep, lastFile.name);
     showChrome();
   } catch (err) {
-    console.error(err);
-    alert('開唔到呢個 PDF：' + (err && err.message ? err.message : err));
-    emptyEl.hidden = false;
+    if (openId === documentGeneration) {
+      console.error(err);
+      alert('開唔到呢個 PDF：' + (err && err.message ? err.message : err));
+      emptyEl.hidden = false;
+    }
   } finally {
-    spinner.hidden = true;
+    if (openId === documentGeneration) spinner.hidden = true;
   }
 }
 
