@@ -20,6 +20,9 @@ const MAX_SCALE = 30;          // 30 CSS px per PDF point ≈ 3000% print — pl
 const DPR = () => Math.min(window.devicePixelRatio || 1, 3);
 
 let pdf = null;
+let documentGeneration = 0;
+let pageRequestId = 0;
+let renderGeneration = 0;
 let pageNum = 1;
 let pageCount = 0;
 let page = null;
@@ -103,6 +106,33 @@ const PREVIEW_MAX = 3;
 const frameCache = new Map();
 const previewCache = new Map();
 let stageCv = null, stageCtx = null;
+
+function releaseFrame(frame) {
+  if (!frame || !frame.cv) return;
+  try { frame.cv.width = 0; frame.cv.height = 0; } catch {}
+}
+
+function clearRenderCaches() {
+  for (const frame of frameCache.values()) releaseFrame(frame);
+  for (const frame of previewCache.values()) releaseFrame(frame);
+  frameCache.clear();
+  previewCache.clear();
+  if (stageCv) { stageCv.width = 0; stageCv.height = 0; }
+  if (canvas) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    canvas.style.transform = 'none';
+  }
+}
+
+function cancelHiRender() {
+  clearTimeout(hiTimer);
+  renderGeneration++;
+  if (renderTask) {
+    try { renderTask.cancel(); } catch {}
+    renderTask = null;
+  }
+}
 let hiTimer = null;
 let lastRenderMs = 0;
 
@@ -146,8 +176,16 @@ function ensureStage(w, h) {
 }
 
 function cachePut(map, key, frame, max) {
+  const previous = map.get(key);
+  if (previous && previous !== frame) releaseFrame(previous);
+  map.delete(key);
   map.set(key, frame);
-  while (map.size > max) map.delete(map.keys().next().value);
+  while (map.size > max) {
+    const oldestKey = map.keys().next().value;
+    const oldest = map.get(oldestKey);
+    map.delete(oldestKey);
+    releaseFrame(oldest);
+  }
 }
 
 /* --- paint whatever is cached for this view (instant, no re-render) --- */
@@ -187,34 +225,62 @@ function blitFrame(f) {
 
 async function ensurePreview(n) {
   if (previewCache.has(n)) return previewCache.get(n);
+  const doc = pdf;
+  const generation = documentGeneration;
+  const wasCurrentPage = n === pageNum;
+  const currentPageRef = wasCurrentPage ? page : null;
   let p;
-  try { p = n === pageNum ? page : await pdf.getPage(n); } catch { return null; }
+  try { p = wasCurrentPage ? currentPageRef : await doc.getPage(n); } catch { return null; }
+  if (!doc || doc !== pdf || generation !== documentGeneration ||
+      (wasCurrentPage && (pageNum !== n || page !== currentPageRef))) return null;
   const pw = p.view[2] - p.view[0], ph = p.view[3] - p.view[1];
   const ps = Math.min(1000, Math.max(640, cw * 1.2)) / pw;
   const vp = p.getViewport({ scale: ps });
   const off = document.createElement('canvas');
   off.width = Math.round(vp.width);
   off.height = Math.round(vp.height);
-  await p.render({ canvasContext: off.getContext('2d'), viewport: vp }).promise;
+  try {
+    await p.render({ canvasContext: off.getContext('2d'), viewport: vp }).promise;
+  } catch (err) {
+    off.width = 0; off.height = 0;
+    throw err;
+  }
+  if (doc !== pdf || generation !== documentGeneration ||
+      (wasCurrentPage && (pageNum !== n || page !== currentPageRef))) {
+    off.width = 0; off.height = 0;
+    return null;
+  }
   const frame = { cv: off, s: ps, dpr: 1, page: n, x0: 0, y0: 0, w: pw, h: ph };
   cachePut(previewCache, n, frame, PREVIEW_MAX);
   return frame;
 }
 
+let primeGeneration = 0;
 function primeNeighbours() {
+  if (gestureActive || !pdf) return;
   const jobs = [pageNum + 1, pageNum - 1, pageNum + 2]
     .filter((n) => n >= 1 && n <= pageCount && !previewCache.has(n));
   if (!jobs.length) return;
-  const run = () => { jobs.forEach((n) => ensurePreview(n).catch(() => {})); };
+  const generation = documentGeneration;
+  const primeId = ++primeGeneration;
+  const run = async () => {
+    for (const n of jobs) {
+      if (generation !== documentGeneration || primeId !== primeGeneration || gestureActive) return;
+      try { await ensurePreview(n); } catch {}
+    }
+  };
   if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 1500 }); else setTimeout(run, 300);
 }
 
 /* --- hi-res render of an overscanned region, swapped in atomically --- */
 
 async function renderHi() {
-  if (!page) return;
+  if (!page || gestureActive) return;
   if (renderTask) { try { renderTask.cancel(); } catch {} }
   renderTask = null;
+  const generation = documentGeneration;
+  const renderId = ++renderGeneration;
+  const pageRef = page;
 
   const dpr = hiDpr();
   const pw = page.view[2] - page.view[0], ph = page.view[3] - page.view[1];
@@ -254,7 +320,8 @@ async function renderHi() {
   const t0 = performance.now();
   try {
     await task.promise;
-    if (pageWant !== pageNum) return;
+    if (generation !== documentGeneration || renderId !== renderGeneration ||
+        pageRef !== page || pageWant !== pageNum || gestureActive) return;
     lastRenderMs = performance.now() - t0;
 
     // atomic swap: the on-screen canvas is never cleared while painting
@@ -301,7 +368,13 @@ function schedulePaint() {
 async function render({ immediate = false } = {}) {
   if (!page) return;
   rafPending = false;
+  if (gestureActive) {
+    schedulePaint();
+    return;
+  }
 
+  const generation = documentGeneration;
+  const pageWant = pageNum;
   const f = bestFrame();
   if (f) {
     const sharpEnough = Math.abs(f.s - s) < 1e-9 && f.dpr >= hiDpr() * 0.98;
@@ -311,7 +384,9 @@ async function render({ immediate = false } = {}) {
   }
 
   clearTimeout(hiTimer);
-  hiTimer = setTimeout(renderHi, f ? 60 : 0);
+  hiTimer = setTimeout(() => {
+    if (!gestureActive && generation === documentGeneration && pageWant === pageNum) renderHi();
+  }, f ? 60 : 0);
 }
 
 function scheduleRender() {
@@ -367,6 +442,7 @@ let moved = 0;
 
 stage.addEventListener('pointerdown', (e) => {
   if (!pdf) return;
+  if (pointers.size === 0) cancelHiRender();
   stage.setPointerCapture(e.pointerId);
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   gestureActive = true;
@@ -469,6 +545,10 @@ stage.addEventListener('wheel', (e) => {
 /* ---------------- open pdf ---------------- */
 
 async function openPdf(data, name) {
+  const openId = ++documentGeneration;
+  pageRequestId++;
+  primeGeneration++;
+  cancelHiRender();
   spinner.hidden = false;
   emptyEl.hidden = true;
   // pdf.js TRANSFERS the buffer to its worker, so keep a copy for IndexedDB first
@@ -480,7 +560,15 @@ async function openPdf(data, name) {
       cMapPacked: true,
       standardFontDataUrl: new URL('../vendor/standard_fonts/', import.meta.url).href,
     }).promise;
+    if (openId !== documentGeneration) {
+      try { await doc.destroy(); } catch {}
+      return;
+    }
+    const oldPdf = pdf;
     pdf = doc;
+    page = null;
+    clearRenderCaches();
+    if (oldPdf && oldPdf !== doc) { try { await oldPdf.destroy(); } catch {} }
     pageCount = doc.numPages;
     pageNum = 1;
     await loadPage(1, { keepView: false });
@@ -491,16 +579,30 @@ async function openPdf(data, name) {
     await saveLast(keep, lastFile.name);
     showChrome();
   } catch (err) {
-    console.error(err);
-    alert('開唔到呢個 PDF：' + (err && err.message ? err.message : err));
-    emptyEl.hidden = false;
+    if (openId === documentGeneration) {
+      console.error(err);
+      alert('開唔到呢個 PDF：' + (err && err.message ? err.message : err));
+      emptyEl.hidden = false;
+    }
   } finally {
-    spinner.hidden = true;
+    if (openId === documentGeneration) spinner.hidden = true;
   }
 }
 
 async function loadPage(n, { keepView = true } = {}) {
-  page = await pdf.getPage(n);
+  if (!pdf || n < 1 || n > pageCount) return;
+  const doc = pdf;
+  const generation = documentGeneration;
+  const requestId = ++pageRequestId;
+  primeGeneration++;
+  cancelHiRender();
+  let nextPage;
+  try { nextPage = await doc.getPage(n); } catch (err) {
+    if (requestId === pageRequestId) console.warn('page load failed', err);
+    return;
+  }
+  if (doc !== pdf || generation !== documentGeneration || requestId !== pageRequestId) return;
+  page = nextPage;
   pageNum = n;
   if (!keepView) { fitWidth(); }
   else { fitWidth(true); }
