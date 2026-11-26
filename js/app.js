@@ -101,6 +101,7 @@ const RATIO_CAP = 2;        // above 2x device pixels extra work is invisible
 const OVERSCAN = 1.7;       // render this much bigger than the viewport so panning needs no reload
 const CACHE_MAX = 3;
 const PREVIEW_MAX = 3;
+const MAX_PREVIEW_PIXELS = 1.2e6;
 
 // frame = { cv, s, dpr, page, x0, y0, w, h }   (x0/y0/w/h in PDF points)
 const frameCache = new Map();
@@ -234,7 +235,8 @@ async function ensurePreview(n) {
   if (!doc || doc !== pdf || generation !== documentGeneration ||
       (wasCurrentPage && (pageNum !== n || page !== currentPageRef))) return null;
   const pw = p.view[2] - p.view[0], ph = p.view[3] - p.view[1];
-  const ps = Math.min(1000, Math.max(640, cw * 1.2)) / pw;
+  const targetWidth = Math.min(1000, Math.max(640, cw * 1.2));
+  const ps = Math.min(targetWidth / pw, Math.sqrt(MAX_PREVIEW_PIXELS / (pw * ph)));
   const vp = p.getViewport({ scale: ps });
   const off = document.createElement('canvas');
   off.width = Math.round(vp.width);
