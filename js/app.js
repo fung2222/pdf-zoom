@@ -91,15 +91,18 @@ function zoomTo(nextS, clientX = cw / 2, clientY = ch / 2) {
   zoomAt(clientX, clientY, nextS / s);
 }
 
-/* ---------------- rendering: frame cache + hi/lo passes ---------------- */
+/* ---------------- rendering: overscan frames + atomic swap ---------------- */
 
-const MAX_PIXELS = 8.2e6;   // pixel budget per on-screen frame (sharp enough, cheap to rasterise)
-const RATIO_CAP = 2;        // above 2x device pixels the extra work is invisible
-const CACHE_MAX = 8;
+const MAX_PIXELS = 6.2e6;   // device-pixel budget for one rendered frame
+const RATIO_CAP = 2;        // above 2x device pixels extra work is invisible
+const OVERSCAN = 1.7;       // render this much bigger than the viewport so panning needs no reload
+const CACHE_MAX = 3;
 const PREVIEW_MAX = 3;
 
-const frameCache = new Map();    // "page@s" -> {cv, s, tx, ty, dpr, ms}
-const previewCache = new Map();  // page -> {cv, s, tx:0, ty:0, dpr:1, w, h} (whole page, low res)
+// frame = { cv, s, dpr, page, x0, y0, w, h }   (x0/y0/w/h in PDF points)
+const frameCache = new Map();
+const previewCache = new Map();
+let stageCv = null, stageCtx = null;
 let hiTimer = null;
 let lastRenderMs = 0;
 
@@ -109,8 +112,17 @@ function hiDpr() {
   return Math.max(1, d);
 }
 
+function viewPts() {
+  return { x0: tx / s, y0: ty / s, w: cw / s, h: ch / s };
+}
+
+function covers(f, v, tol = 1) {
+  return v.x0 >= f.x0 - tol && v.y0 >= f.y0 - tol &&
+         v.x0 + v.w <= f.x0 + f.w + tol && v.y0 + v.h <= f.y0 + f.h + tol;
+}
+
 function applyTransient() {
-  // cheap gesture feedback: re-map the frame already on screen
+  // last-resort gesture feedback when no cached frame covers the view
   const k = s / rendered.s;
   const dx = rendered.tx * k - tx;
   const dy = rendered.ty * k - ty;
@@ -124,44 +136,44 @@ function ensureCanvas(dpr) {
   canvas.style.height = ch + 'px';
 }
 
-/* --- cache helpers --- */
+function ensureStage(w, h) {
+  if (!stageCv) {
+    stageCv = document.createElement('canvas');
+    stageCtx = stageCv.getContext('2d', { alpha: true });
+  }
+  if (stageCv.width !== w || stageCv.height !== h) { stageCv.width = w; stageCv.height = h; }
+  return stageCtx;
+}
 
 function cachePut(map, key, frame, max) {
   map.set(key, frame);
   while (map.size > max) map.delete(map.keys().next().value);
 }
 
-function coversView(f) {
-  const sx = (tx * f.s / s - f.tx) * f.dpr;
-  const sw = (cw / s) * f.s * f.dpr;
-  const sy = (ty * f.s / s - f.ty) * f.dpr;
-  const sh = (ch / s) * f.s * f.dpr;
-  return sx >= -1.5 && sy >= -1.5 &&
-         sx + sw <= f.cv.width + 1.5 && sy + sh <= f.cv.height + 1.5 &&
-         sw > 8 && sh > 8;
-}
+/* --- paint whatever is cached for this view (instant, no re-render) --- */
 
 function bestFrame() {
-  const prev = previewCache.get(pageNum);
+  const v = viewPts();
   let best = null, bestScore = -1;
   for (const f of frameCache.values()) {
-    if (f.page !== pageNum || !coversView(f)) continue;
-    // sharpness matters most, then how fresh the offset is
+    if (f.page !== pageNum || !covers(f, v)) continue;
     const sharp = Math.min(f.s / s, 1);
-    const score = sharp * 1000 - (Math.abs(f.tx - tx) + Math.abs(f.ty - ty)) * 0.02;
+    const score = sharp * 1000 - Math.abs(Math.log(f.s / s)) * 20;
     if (score > bestScore) { bestScore = score; best = f; }
   }
   if (best) return best;
-  if (prev && coversView(prev)) return prev;
+  const p = previewCache.get(pageNum);
+  if (p && covers(p, v)) return p;
   return null;
 }
 
 function blitFrame(f) {
+  const v = viewPts();
+  const sx = (v.x0 - f.x0) * f.s * f.dpr;
+  const sy = (v.y0 - f.y0) * f.s * f.dpr;
+  const sw = v.w * f.s * f.dpr;
+  const sh = v.h * f.s * f.dpr;
   ensureCanvas(f.dpr);
-  const sx = (tx * f.s / s - f.tx) * f.dpr;
-  const sw = (cw / s) * f.s * f.dpr;
-  const sy = (ty * f.s / s - f.ty) * f.dpr;
-  const sh = (ch / s) * f.s * f.dpr;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.imageSmoothingEnabled = true;
@@ -171,46 +183,33 @@ function blitFrame(f) {
   canvas.style.transform = 'none';
 }
 
-/* --- low-res whole-page preview (instant flips / pans) --- */
+/* --- low-res whole-page preview (page flips, far pans) --- */
 
 async function ensurePreview(n) {
   if (previewCache.has(n)) return previewCache.get(n);
   let p;
   try { p = n === pageNum ? page : await pdf.getPage(n); } catch { return null; }
-  const pw = p.view[2] - p.view[0];
-  const targetCssW = Math.min(1100, Math.max(680, cw * 1.25));
-  const ps = targetCssW / pw;
+  const pw = p.view[2] - p.view[0], ph = p.view[3] - p.view[1];
+  const ps = Math.min(1000, Math.max(640, cw * 1.2)) / pw;
   const vp = p.getViewport({ scale: ps });
   const off = document.createElement('canvas');
   off.width = Math.round(vp.width);
   off.height = Math.round(vp.height);
-  const octx = off.getContext('2d');
-  await p.render({ canvasContext: octx, viewport: vp }).promise;
-  const frame = { cv: off, s: ps, tx: 0, ty: 0, dpr: 1, page: n };
+  await p.render({ canvasContext: off.getContext('2d'), viewport: vp }).promise;
+  const frame = { cv: off, s: ps, dpr: 1, page: n, x0: 0, y0: 0, w: pw, h: ph };
   cachePut(previewCache, n, frame, PREVIEW_MAX);
   return frame;
 }
 
 function primeNeighbours() {
-  const jobs = [pageNum + 1, pageNum - 1, pageNum + 2].filter((n) => n >= 1 && n <= pageCount && !previewCache.has(n));
+  const jobs = [pageNum + 1, pageNum - 1, pageNum + 2]
+    .filter((n) => n >= 1 && n <= pageCount && !previewCache.has(n));
   if (!jobs.length) return;
   const run = () => { jobs.forEach((n) => ensurePreview(n).catch(() => {})); };
-  if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 1200 }); else setTimeout(run, 250);
+  if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 1500 }); else setTimeout(run, 300);
 }
 
-/* --- hi-res viewport render: draw offscreen, then swap in one go --- */
-
-let stageCv = null, stageCtx = null;
-
-function ensureStage(dpr) {
-  const w = Math.round(cw * dpr), h = Math.round(ch * dpr);
-  if (!stageCv) {
-    stageCv = document.createElement('canvas');
-    stageCtx = stageCv.getContext('2d', { alpha: true });
-  }
-  if (stageCv.width !== w || stageCv.height !== h) { stageCv.width = w; stageCv.height = h; }
-  return stageCtx;
-}
+/* --- hi-res render of an overscanned region, swapped in atomically --- */
 
 async function renderHi() {
   if (!page) return;
@@ -218,42 +217,66 @@ async function renderHi() {
   renderTask = null;
 
   const dpr = hiDpr();
+  const pw = page.view[2] - page.view[0], ph = page.view[3] - page.view[1];
+  const v = viewPts();
   const sWant = s, txWant = tx, tyWant = ty, pageWant = pageNum;
-  const sc = ensureStage(dpr);
+
+  // region to render: overscan around the viewport, clamped to the page and to the pixel budget
+  let fw = Math.min(pw, v.w * OVERSCAN);
+  let fh = Math.min(ph, v.h * OVERSCAN);
+  const maxAreaPt = MAX_PIXELS / (sWant * sWant * dpr * dpr);
+  if (fw * fh > maxAreaPt) {
+    const k = Math.sqrt(maxAreaPt / (fw * fh));
+    fw = Math.max(v.w, fw * k);
+    fh = Math.max(v.h, fh * k);
+  }
+  let fx0 = v.x0 - (fw - v.w) / 2;
+  let fy0 = v.y0 - (fh - v.h) / 2;
+  fx0 = Math.max(0, Math.min(pw - fw, fx0));
+  fy0 = Math.max(0, Math.min(ph - fh, fy0));
+  if (fx0 > v.x0) { fx0 = v.x0; fw = Math.min(pw, fw + (v.x0 - fx0)); }
+  if (fy0 > v.y0) { fy0 = v.y0; fh = Math.min(ph, fh + (v.y0 - fy0)); }
+
+  const wPx = Math.max(1, Math.round(fw * sWant * dpr));
+  const hPx = Math.max(1, Math.round(fh * sWant * dpr));
+  const sc = ensureStage(wPx, hPx);
   sc.setTransform(1, 0, 0, 1, 0, 0);
-  sc.clearRect(0, 0, stageCv.width, stageCv.height);
+  sc.clearRect(0, 0, wPx, hPx);
 
   const viewport = page.getViewport({ scale: sWant * dpr });
   const task = page.render({
     canvasContext: sc,
     viewport,
-    transform: [1, 0, 0, 1, -txWant * dpr, -tyWant * dpr],
+    transform: [1, 0, 0, 1, -fx0 * sWant * dpr, -fy0 * sWant * dpr],
     intent: 'display',
   });
   renderTask = task;
   const t0 = performance.now();
   try {
     await task.promise;
-    if (pageWant !== pageNum) return;          // page changed while rendering
+    if (pageWant !== pageNum) return;
     lastRenderMs = performance.now() - t0;
 
-    // single atomic swap: on-screen canvas is never cleared/progressively filled
+    // atomic swap: the on-screen canvas is never cleared while painting
     ensureCanvas(dpr);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(stageCv, 0, 0);
+    const sx = (v.x0 - fx0) * sWant * dpr;
+    const sy = (v.y0 - fy0) * sWant * dpr;
+    ctx.drawImage(stageCv, sx, sy, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
     rendered = { s: sWant, tx: txWant, ty: tyWant, page: pageWant };
     canvas.style.transform = 'none';
 
     const off = document.createElement('canvas');
-    off.width = stageCv.width; off.height = stageCv.height;
+    off.width = wPx; off.height = hPx;
     off.getContext('2d').drawImage(stageCv, 0, 0);
-    cachePut(frameCache, `${pageWant}@${sWant.toFixed(3)}`,
-      { cv: off, s: sWant, tx: txWant, ty: tyWant, dpr, page: pageWant }, CACHE_MAX);
+    cachePut(frameCache, `${pageWant}@${sWant.toFixed(3)}@${Math.round(fx0)},${Math.round(fy0)}`,
+      { cv: off, s: sWant, dpr, page: pageWant, x0: fx0, y0: fy0, w: fw, h: fh }, CACHE_MAX);
+
     updateHud();
     primeNeighbours();
     scheduleSnap();
-    saveLastPos(pageWant);        // remember zoom + position, not just the page
+    saveLastPos(pageWant);
   } catch (err) {
     if (err && err.name !== 'RenderingCancelledException') console.warn(err);
   } finally {
@@ -261,23 +284,34 @@ async function renderHi() {
   }
 }
 
-/* --- public render: keep the picture on screen, sharpen behind it --- */
+/* --- public render: paint from cache; only re-render when truly needed --- */
+
+let panRaf = false;
+function schedulePaint() {
+  // used during gestures: repaint from cache on the next frame (image-like pan/zoom)
+  if (panRaf) return;
+  panRaf = true;
+  requestAnimationFrame(() => {
+    panRaf = false;
+    const f = bestFrame();
+    if (f) blitFrame(f); else applyTransient();
+  });
+}
 
 async function render({ immediate = false } = {}) {
   if (!page) return;
   rafPending = false;
 
-  // Only repaint from cache when the current picture is useless for this view
-  // (page changed, or the zoom jumped so far the stretch would look broken).
-  const ratio = rendered.s / s;
-  const tooFar = rendered.page !== pageNum || ratio > 3 || ratio < 1 / 3;
-  if (tooFar) {
-    const f = bestFrame();
-    if (f) { blitFrame(f); updateHud(); }
+  const f = bestFrame();
+  if (f) {
+    const sharpEnough = Math.abs(f.s - s) < 1e-9 && f.dpr >= hiDpr() * 0.98;
+    blitFrame(f);
+    updateHud();
+    if (sharpEnough) { primeNeighbours(); return; }   // panning inside an overscan frame: zero work
   }
 
   clearTimeout(hiTimer);
-  hiTimer = setTimeout(renderHi, immediate || tooFar ? 0 : 40);
+  hiTimer = setTimeout(renderHi, f ? 60 : 0);
 }
 
 function scheduleRender() {
@@ -364,7 +398,7 @@ stage.addEventListener('pointermove', (e) => {
     tx = dragStart.tx - dx;
     ty = dragStart.ty - dy;
     clampView();
-    applyTransient();
+    schedulePaint();
   } else if (pointers.size === 2 && pinchStart) {
     const [a, b] = [...pointers.values()];
     const dist = Math.hypot(a.x - b.x, a.y - b.y);
@@ -379,7 +413,7 @@ stage.addEventListener('pointermove', (e) => {
     ty = (ty + pinchStart.cy) * k - cy;
     s = ns;
     clampView();
-    applyTransient();
+    schedulePaint();
     flashZoom();
   }
 });
