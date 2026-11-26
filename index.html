@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0b0b0c">
+<title>PDF</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div id="stage">
+  <canvas id="view"></canvas>
+  <div id="drop" class="hint" hidden>放開即開</div>
+  <div id="empty">
+    <div class="circle">PDF</div>
+    <p>開啟你想放大睇嘅 PDF</p>
+    <button id="pick" class="primary">揀檔案</button>
+    <p class="small">亦可以喺 WhatsApp 揀「分享」→ 呢個 App</p>
+  </div>
+  <div id="spinner" hidden></div>
+  <div id="badge" hidden></div>
+</div>
+
+<header id="top">
+  <button id="openBtn" class="ghost" title="開啟">開啟</button>
+  <span id="pgLabel" class="pg" hidden>1 / 1</span>
+  <button id="fitBtn" class="ghost" title="符合闊度" hidden>符合</button>
+</header>
+
+<nav id="bottom" hidden>
+  <button id="prev" class="nav" title="上一頁">‹</button>
+  <div id="zoomWrap">
+    <button id="zoomOut" class="nav">−</button>
+    <span id="zoomLabel">100%</span>
+    <button id="zoomIn" class="nav">+</button>
+  </div>
+  <button id="next" class="nav" title="下一頁">›</button>
+</nav>
+
+<input id="file" type="file" accept="application/pdf,.pdf" hidden>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
