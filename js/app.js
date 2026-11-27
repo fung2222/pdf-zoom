@@ -15,6 +15,12 @@ const pgLabel = document.getElementById('pgLabel');
 const zoomLabel = document.getElementById('zoomLabel');
 const fitBtn = document.getElementById('fitBtn');
 const fileInput = document.getElementById('file');
+const homeEl = document.getElementById('home');
+const homeList = document.getElementById('homeList');
+const homeTitle = document.getElementById('homeTitle');
+const currentFavoriteBtn = document.getElementById('favoriteBtn');
+let homeMode = 'recent';
+let currentFileId = null;
 
 const MAX_SCALE = 30;          // 30 CSS px per PDF point ≈ 3000% print — plenty for site drawings
 const DPR = () => Math.min(window.devicePixelRatio || 1, 3);
@@ -65,20 +71,20 @@ function pageSize() {
 function clampView() {
   const { w, h } = pageSize();
   const contentW = w * s, contentH = h * s;
-  const loX = Math.min(0, contentW - cw), hiX = Math.max(0, contentW - cw);
-  const loY = Math.min(0, contentH - ch), hiY = Math.max(0, contentH - ch);
-  tx = Math.min(hiX, Math.max(loX, tx));
-  ty = Math.min(hiY, Math.max(loY, ty));
+  if (contentW <= cw) tx = (cw - contentW) / 2;
+  else tx = Math.min(0, Math.max(cw - contentW, tx));
+  if (contentH <= ch) ty = (ch - contentH) / 2;
+  else ty = Math.min(0, Math.max(ch - contentH, ty));
 }
 
 function fitWidth(keepY = false) {
   const { w } = pageSize();
   fitScale = cw / w;
   s = fitScale;
-  tx = 0;
+  tx = (cw - w * s) / 2;
   if (!keepY) {
     const { h } = pageSize();
-    ty = Math.min(0, Math.max(0, (h * s - ch) / 2));
+    ty = (ch - h * s) / 2;
   }
   clampView();
 }
@@ -103,35 +109,26 @@ function zoomTo(nextS, clientX = cw / 2, clientY = ch / 2) {
   zoomAt(clientX, clientY, nextS / s);
 }
 
-/* ---------------- rendering: cached PDF tiles ---------------- */
+/* ---------------- rendering: full-page preview + one detail canvas ---------------- */
 
-const TILE_SIZE = 512;                 // CSS pixels per tile at its render scale
-const TILE_CACHE_BYTES = 64 * 1024 * 1024;
-const TILE_CONCURRENCY = 2;
+const MAX_DETAIL_PIXELS = 8 * 1024 * 1024;
+const MAX_DETAIL_DIMENSION = 8192;
 const MAX_PREVIEW_PIXELS = 1.2e6;
 const previewCache = new Map();
-const tileCache = new Map();
-let tileBytes = 0;
-// A full-page low-resolution backing image stays visible throughout gestures.
-// It is transformed by the compositor while sharp tiles are rendered in the background.
 const previewLayer = document.createElement('canvas');
 previewLayer.id = 'previewLayer';
 previewLayer.style.cssText = 'position:absolute;left:0;top:0;pointer-events:none;transform-origin:0 0;will-change:transform;z-index:1;';
 stage.insertBefore(previewLayer, canvas.nextSibling);
 const previewCtx = previewLayer.getContext('2d', { alpha: false });
-let tileLayer = document.createElement('div');
-tileLayer.id = 'tileLayer';
-tileLayer.style.cssText = 'position:absolute;inset:0;overflow:visible;pointer-events:none;transform-origin:0 0;will-change:transform;z-index:2;';
-stage.insertBefore(tileLayer, previewLayer.nextSibling);
+const detailLayer = document.createElement('div');
+detailLayer.id = 'detailLayer';
+detailLayer.style.cssText = 'position:absolute;inset:0;overflow:visible;pointer-events:none;transform-origin:0 0;will-change:transform;z-index:2;';
+stage.insertBefore(detailLayer, previewLayer.nextSibling);
 
-let activeTileTasks = new Set();
-let activeTileKeys = new Set();
-let tileQueue = [];
-let tileWorkers = 0;
-let wantedTileKeys = new Set();
-let currentTileBucket = 0;
-let currentTileDpr = 1;
-let tileEpoch = 0;
+let detailState = null;
+let detailTask = null;
+let detailTimer = null;
+let detailGeneration = 0;
 
 function releaseFrame(frame) {
   if (!frame || !frame.cv) return;
@@ -139,16 +136,13 @@ function releaseFrame(frame) {
 }
 
 function clearRenderCaches() {
+  cancelHiRender();
   for (const frame of previewCache.values()) releaseFrame(frame);
   previewCache.clear();
-  for (const tile of tileCache.values()) releaseTile(tile);
-  tileCache.clear();
-  tileBytes = 0;
-  tileQueue = [];
-  wantedTileKeys.clear();
-  tileEpoch++;
-  tileLayer.replaceChildren();
-  previewLayer.width = 1; previewLayer.height = 1;
+  detailLayer.replaceChildren();
+  detailState = null;
+  previewLayer.width = 1;
+  previewLayer.height = 1;
   previewLayer.style.display = 'none';
   if (canvas) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -157,52 +151,27 @@ function clearRenderCaches() {
   }
 }
 
-function releaseTile(tile) {
-  if (!tile || !tile.cv) return;
-  tileBytes = Math.max(0, tileBytes - (tile.bytes || 0));
-  try { tile.cv.width = 0; tile.cv.height = 0; } catch {}
-}
-
 function cancelHiRender() {
-  clearTimeout(hiTimer);
-  renderGeneration++;
-  tileEpoch++;
-  for (const task of activeTileTasks) {
-    try { task.cancel(); } catch {}
+  clearTimeout(detailTimer);
+  detailGeneration++;
+  if (detailTask) {
+    try { detailTask.cancel(); } catch {}
+    detailTask = null;
   }
-  activeTileTasks.clear();
-  tileQueue = [];
 }
-let hiTimer = null;
 
-function tileScale() {
-  // Quantized scale avoids rerendering for tiny pinch fluctuations.
+function quantizedScale() {
   return Math.pow(2, Math.round(Math.log2(Math.max(s, 0.001)) * 8) / 8);
 }
 
-function hiDpr() { return tileDpr(); }
-
-function tileDpr() {
-  return Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
-}
-
 function viewPts() {
-  return { x0: tx / s, y0: ty / s, w: cw / s, h: ch / s };
+  return { x0: -tx / s, y0: -ty / s, w: cw / s, h: ch / s };
 }
 
 function applyTransient() {
-  // Never transform the viewport-sized canvas: it has no pixels outside the
-  // old viewport and therefore appears to vanish when pinching/panning.
   const transform = `translate(${tx}px, ${ty}px) scale(${s})`;
   previewLayer.style.transform = transform;
-  tileLayer.style.transform = transform;
-}
-
-function ensureCanvas(dpr) {
-  const w = Math.round(cw * dpr), h = Math.round(ch * dpr);
-  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
-  canvas.style.width = cw + 'px';
-  canvas.style.height = ch + 'px';
+  detailLayer.style.transform = transform;
 }
 
 function cachePreview(n, frame) {
@@ -210,35 +179,11 @@ function cachePreview(n, frame) {
   if (old && old !== frame) releaseFrame(old);
   previewCache.delete(n);
   previewCache.set(n, frame);
-  while (previewCache.size > 3) {
+  while (previewCache.size > 2) {
     const key = previewCache.keys().next().value;
     releaseFrame(previewCache.get(key));
     previewCache.delete(key);
   }
-}
-
-function cacheTile(key, tile) {
-  const old = tileCache.get(key);
-  if (old) releaseTile(old);
-  tileCache.delete(key);
-  tileCache.set(key, tile);
-  tileBytes += tile.bytes;
-  while (tileBytes > TILE_CACHE_BYTES && tileCache.size > 1) {
-    const oldestKey = tileCache.keys().next().value;
-    const oldest = tileCache.get(oldestKey);
-    tileCache.delete(oldestKey);
-    if (oldest.cv.parentNode) oldest.cv.remove();
-    releaseTile(oldest);
-  }
-}
-
-function touchTile(key, tile) {
-  tileCache.delete(key);
-  tileCache.set(key, tile);
-}
-
-function tileKey(pageNo, bucket, dpr, ix, iy) {
-  return `${documentGeneration}:${pageNo}:${bucket.toFixed(4)}:${dpr}:${ix}:${iy}`;
 }
 
 async function ensurePreview(n) {
@@ -271,136 +216,141 @@ async function ensurePreview(n) {
     off.width = 0; off.height = 0;
     return null;
   }
-  const frame = { cv: off, s: ps, dpr: 1, page: n, x0: 0, y0: 0, w: pw, h: ph };
+  const frame = { cv: off, s: ps, page: n, w: pw, h: ph };
   cachePreview(n, frame);
   return frame;
 }
 
-function blitFrame(f) {
-  if (!page || !f || !f.cv) return;
+function blitFrame(frame) {
+  if (!page || !frame || !frame.cv) return;
   const vp = page.getViewport({ scale: 1 });
-  previewLayer.width = f.cv.width;
-  previewLayer.height = f.cv.height;
+  previewLayer.width = frame.cv.width;
+  previewLayer.height = frame.cv.height;
   previewLayer.style.width = vp.width + 'px';
   previewLayer.style.height = vp.height + 'px';
   previewCtx.setTransform(1, 0, 0, 1, 0, 0);
   previewCtx.clearRect(0, 0, previewLayer.width, previewLayer.height);
   previewCtx.imageSmoothingEnabled = true;
   previewCtx.imageSmoothingQuality = 'high';
-  previewCtx.drawImage(f.cv, 0, 0);
+  previewCtx.drawImage(frame.cv, 0, 0);
   previewLayer.style.display = 'block';
   canvas.style.display = 'none';
   applyTransient();
 }
 
-function trimTileCache() {
-  while (tileBytes > TILE_CACHE_BYTES && tileCache.size > 1) {
-    const key = tileCache.keys().next().value;
-    const tile = tileCache.get(key);
-    tileCache.delete(key);
-    if (tile.cv.parentNode) tile.cv.remove();
-    releaseTile(tile);
-  }
+function detailAreaCovers(visible, bucket) {
+  if (!detailState || Math.abs(detailState.scale - bucket) > 0.0001) return false;
+  const d = detailState;
+  const pageViewport = page.getViewport({ scale: 1 });
+  const right = d.x + d.w, bottom = d.y + d.h;
+  if (visible.x0 < d.x || visible.y0 < d.y ||
+      visible.x0 + visible.w > right || visible.y0 + visible.h > bottom) return false;
+  const leftPad = visible.x0 - d.x;
+  const rightPad = right - (visible.x0 + visible.w);
+  const topPad = visible.y0 - d.y;
+  const bottomPad = bottom - (visible.y0 + visible.h);
+  // At a physical page edge no extra margin is needed on that side.
+  const leftReady = d.x <= 0 || leftPad > visible.w * 0.5;
+  const rightReady = right >= pageViewport.width || rightPad > visible.w * 0.5;
+  const topReady = d.y <= 0 || topPad > visible.h * 0.5;
+  const bottomReady = bottom >= pageViewport.height || bottomPad > visible.h * 0.5;
+  return leftReady && rightReady && topReady && bottomReady;
 }
 
-function paintWantedTiles() {
-  const v = viewPts();
-  const bucket = currentTileBucket;
-  const dpr = currentTileDpr;
-  const tilePageSize = TILE_SIZE / bucket;
-  const maxX = Math.max(0, Math.ceil((page.getViewport({scale:1}).width * bucket) / TILE_SIZE) - 1);
-  const maxY = Math.max(0, Math.ceil((page.getViewport({scale:1}).height * bucket) / TILE_SIZE) - 1);
-  const x0 = Math.max(0, Math.floor(v.x0 / tilePageSize) - 1);
-  const y0 = Math.max(0, Math.floor(v.y0 / tilePageSize) - 1);
-  const x1 = Math.min(maxX, Math.floor((v.x0 + v.w) / tilePageSize) + 1);
-  const y1 = Math.min(maxY, Math.floor((v.y0 + v.h) / tilePageSize) + 1);
-  const desired = [];
-  for (let iy=y0; iy<=y1; iy++) {
-    for (let ix=x0; ix<=x1; ix++) {
-      const key = tileKey(pageNum, bucket, dpr, ix, iy);
-      desired.push({key, ix, iy, distance: Math.hypot((ix+.5)*tilePageSize-(v.x0+v.w/2), (iy+.5)*tilePageSize-(v.y0+v.h/2))});
-    }
-  }
-  desired.sort((a,b)=>a.distance-b.distance);
-  wantedTileKeys = new Set(desired.map(t=>t.key));
-  tileLayer.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`;
-  previewLayer.style.transform = tileLayer.style.transform;
-  const keep = new Set();
-  for (const item of desired) {
-    let tile = tileCache.get(item.key);
-    if (tile) {
-      touchTile(item.key, tile);
-      tile.cv.style.display = '';
-      if (tile.cv.parentNode !== tileLayer) tileLayer.appendChild(tile.cv);
-      keep.add(item.key);
-    } else {
-      enqueueTile(item);
-    }
-  }
-  for (const child of [...tileLayer.children]) {
-    if (![...keep].some(key => tileCache.get(key)?.cv === child)) child.remove();
-  }
-  pumpTileQueue();
-}
+async function renderDetail() {
+  if (!pdf || !page || gestureActive) return;
+  const doc = pdf;
+  const pageRef = page;
+  const pageNo = pageNum;
+  const generation = documentGeneration;
+  const visible = viewPts();
+  const pageViewport = pageRef.getViewport({ scale: 1 });
+  const pageW = pageViewport.width, pageH = pageViewport.height;
+  const visibleX0 = Math.max(0, Math.min(pageW, visible.x0));
+  const visibleY0 = Math.max(0, Math.min(pageH, visible.y0));
+  const visibleX1 = Math.max(visibleX0, Math.min(pageW, visible.x0 + visible.w));
+  const visibleY1 = Math.max(visibleY0, Math.min(pageH, visible.y0 + visible.h));
+  const visibleArea = {
+    x0: visibleX0, y0: visibleY0,
+    w: Math.max(1, visibleX1 - visibleX0),
+    h: Math.max(1, visibleY1 - visibleY0),
+  };
+  const bucket = quantizedScale();
+  if (detailAreaCovers(visibleArea, bucket)) return;
 
-function enqueueTile(item) {
-  if (tileQueue.some(job => job.key === item.key) || activeTileKeys.has(item.key) || tileCache.has(item.key)) return;
-  tileQueue.push({...item, epoch: tileEpoch, generation: documentGeneration, pageNo: pageNum, bucket: currentTileBucket, dpr: currentTileDpr});
-  tileQueue.sort((a,b)=>a.distance-b.distance);
-}
+  const visiblePixels = Math.max(1, cw * ch * Math.pow(Math.min(window.devicePixelRatio || 1, 2), 2));
+  const maxLinearRatio = Math.sqrt(MAX_DETAIL_PIXELS / visiblePixels);
+  const overflow = Math.max(0, Math.min(1, (maxLinearRatio - 1) / 2));
+  const extraX = visibleArea.w * overflow;
+  const extraY = visibleArea.h * overflow;
+  const x0 = Math.max(0, visibleArea.x0 - extraX);
+  const y0 = Math.max(0, visibleArea.y0 - extraY);
+  const x1 = Math.min(pageW, visibleArea.x0 + visibleArea.w + extraX);
+  const y1 = Math.min(pageH, visibleArea.y0 + visibleArea.h + extraY);
+  const areaW = Math.max(1, x1 - x0);
+  const areaH = Math.max(1, y1 - y0);
 
-function pumpTileQueue() {
-  while (tileWorkers < TILE_CONCURRENCY && tileQueue.length) {
-    const job = tileQueue.shift();
-    if (job.generation !== documentGeneration || job.pageNo !== pageNum || job.epoch !== tileEpoch || !wantedTileKeys.has(job.key)) continue;
-    tileWorkers++;
-    renderTile(job).finally(() => {
-      tileWorkers--;
-      pumpTileQueue();
-    });
+  let outputScale = Math.min(window.devicePixelRatio || 1, 2);
+  outputScale = Math.min(outputScale,
+    Math.sqrt(MAX_DETAIL_PIXELS / Math.max(1, areaW * areaH * bucket * bucket)));
+  outputScale = Math.min(outputScale,
+    MAX_DETAIL_DIMENSION / Math.max(1, areaW * bucket),
+    MAX_DETAIL_DIMENSION / Math.max(1, areaH * bucket));
+  outputScale = Math.max(0.5, outputScale);
+
+  const pixelW = Math.max(1, Math.ceil(areaW * bucket * outputScale));
+  const pixelH = Math.max(1, Math.ceil(areaH * bucket * outputScale));
+  const nextCanvas = document.createElement('canvas');
+  nextCanvas.className = 'detail-canvas';
+  nextCanvas.width = pixelW;
+  nextCanvas.height = pixelH;
+  nextCanvas.style.cssText =
+    `position:absolute;left:${x0}px;top:${y0}px;width:${areaW}px;height:${areaH}px;max-width:none;max-height:none;`;
+
+  const token = ++detailGeneration;
+  if (detailTask) {
+    try { detailTask.cancel(); } catch {}
+    detailTask = null;
   }
-}
 
-async function renderTile(job) {
-  const doc = pdf, pageRef = page;
-  if (!doc || !pageRef || job.generation !== documentGeneration) return;
-  const viewport1 = pageRef.getViewport({scale:1});
-  const tilePageSize = TILE_SIZE / job.bucket;
-  const x0 = job.ix * tilePageSize, y0 = job.iy * tilePageSize;
-  const w = Math.min(tilePageSize, viewport1.width - x0);
-  const h = Math.min(tilePageSize, viewport1.height - y0);
-  if (w <= 0 || h <= 0) return;
-  const pixelW = Math.max(1, Math.ceil(w * job.bucket * job.dpr));
-  const pixelH = Math.max(1, Math.ceil(h * job.bucket * job.dpr));
-  const cv = document.createElement('canvas');
-  cv.width = pixelW; cv.height = pixelH;
-  cv.style.cssText = `position:absolute;left:${x0}px;top:${y0}px;width:${w}px;height:${h}px;max-width:none;max-height:none;`;
-  const viewport = pageRef.getViewport({scale:job.bucket * job.dpr});
-  activeTileKeys.add(job.key);
+  const viewport = pageRef.getViewport({ scale: bucket * outputScale });
+  const transform = [1, 0, 0, 1, -x0 * bucket * outputScale, -y0 * bucket * outputScale];
+  const started = performance.now();
   const task = pageRef.render({
-    canvasContext: cv.getContext('2d', {alpha:false}),
+    canvasContext: nextCanvas.getContext('2d', { alpha: false }),
     viewport,
-    transform: [1,0,0,1,-x0*job.bucket*job.dpr,-y0*job.bucket*job.dpr],
+    transform,
     intent: 'display',
   });
-  activeTileTasks.add(task);
+  detailTask = task;
   try {
     await task.promise;
-    if (doc !== pdf || pageRef !== page || job.generation !== documentGeneration || job.pageNo !== pageNum) {
-      cv.width=0; cv.height=0; return;
+    if (token !== detailGeneration || doc !== pdf || pageRef !== page ||
+        pageNo !== pageNum || generation !== documentGeneration) {
+      nextCanvas.width = 0; nextCanvas.height = 0;
+      return;
     }
-    const tile = {cv, bytes: pixelW*pixelH*4, key:job.key};
-    cacheTile(job.key, tile);
-    if (wantedTileKeys.has(job.key) && job.bucket === currentTileBucket && job.dpr === currentTileDpr) {
-      tileLayer.appendChild(cv);
+    detailLayer.replaceChildren(nextCanvas);
+    if (detailState && detailState.canvas) {
+      detailState.canvas.width = 0;
+      detailState.canvas.height = 0;
     }
+    detailState = { canvas: nextCanvas, x: x0, y: y0, w: areaW, h: areaH, scale: bucket };
+    lastRenderMs = Math.round(performance.now() - started);
+    applyTransient();
   } catch (err) {
-    cv.width=0; cv.height=0;
-    if (err && err.name !== 'RenderingCancelledException') console.warn('Tile render failed', err);
+    nextCanvas.width = 0; nextCanvas.height = 0;
+    if (err && err.name !== 'RenderingCancelledException') console.warn('Detail render failed', err);
   } finally {
-    activeTileTasks.delete(task);
-    activeTileKeys.delete(job.key);
+    if (detailTask === task) detailTask = null;
   }
+}
+
+function scheduleDetailRender(immediate = false) {
+  clearTimeout(detailTimer);
+  if (gestureActive) return;
+  const delay = immediate ? 0 : 120;
+  detailTimer = setTimeout(() => renderDetail().catch(err => console.warn(err)), delay);
 }
 
 function schedulePaint() {
@@ -412,15 +362,14 @@ function schedulePaint() {
   });
 }
 
-async function render() {
+async function render(options = {}) {
   if (!page) return;
   rafPending = false;
   if (gestureActive) { schedulePaint(); return; }
-  currentTileBucket = tileScale();
-  currentTileDpr = tileDpr();
-  paintWantedTiles();
+  applyTransient();
   updateHud();
   saveLastPos(pageNum);
+  scheduleDetailRender(!!options.immediate);
 }
 
 function scheduleRender() {
@@ -560,7 +509,7 @@ function endPointer(e) {
       document.body.classList.toggle('hide-chrome');
       showChrome();
     }
-    render();
+    render({ immediate: true });
     showChrome();
   }
 }
@@ -581,11 +530,14 @@ stage.addEventListener('wheel', (e) => {
 
 /* ---------------- open pdf ---------------- */
 
-async function openPdf(data, name) {
+async function openPdf(data, name, existingFileId = null) {
   const openId = ++documentGeneration;
   pageRequestId++;
   primeGeneration++;
   cancelHiRender();
+  homeEl.hidden = true;
+  stage.hidden = false;
+  topEl.hidden = false;
   spinner.hidden = false;
   emptyEl.hidden = true;
   // pdf.js TRANSFERS the buffer to its worker, so keep a copy for IndexedDB first
@@ -612,7 +564,14 @@ async function openPdf(data, name) {
     topEl.hidden = false; bottomEl.hidden = false;
     pgLabel.hidden = false; fitBtn.hidden = false;
     lastFile = { name: name || 'document.pdf' };
+    homeEl.hidden = true;
+    stage.hidden = false;
+    topEl.hidden = false; bottomEl.hidden = false;
+    pgLabel.hidden = false; fitBtn.hidden = false;
+    currentFileId = await saveRecentFile(keep, lastFile.name, existingFileId);
+    lastFile.id = currentFileId;
     await saveLast(keep, lastFile.name);
+    updateFavoriteButton();
     showChrome();
   } catch (err) {
     if (openId === documentGeneration) {
@@ -640,6 +599,12 @@ async function loadPage(n, { keepView = true } = {}) {
   if (doc !== pdf || generation !== documentGeneration || requestId !== pageRequestId) return;
   page = nextPage;
   pageNum = n;
+  if (detailState && detailState.canvas) {
+    detailState.canvas.width = 0;
+    detailState.canvas.height = 0;
+  }
+  detailLayer.replaceChildren();
+  detailState = null;
   if (!keepView) { fitWidth(); }
   else { fitWidth(true); }
   let prev = previewCache.get(n);
@@ -682,6 +647,11 @@ fileInput.addEventListener('change', (e) => {
 });
 
 document.getElementById('openBtn').addEventListener('click', () => fileInput.click());
+document.getElementById('homeOpen').addEventListener('click', () => fileInput.click());
+document.getElementById('homeRecent').addEventListener('click', () => { homeMode='recent'; renderHome(); });
+document.getElementById('homeFavorites').addEventListener('click', () => { homeMode='favorites'; renderHome(); });
+document.getElementById('backHome').addEventListener('click', closeReaderToHome);
+currentFavoriteBtn.addEventListener('click', toggleCurrentFavorite);
 document.getElementById('pick').addEventListener('click', () => fileInput.click());
 document.getElementById('next').addEventListener('click', nextPage);
 document.getElementById('prev').addEventListener('click', prevPage);
@@ -703,12 +673,12 @@ window.__pz = {
   state: () => ({ s, tx, ty, fitScale, pageNum, pageCount, cw, ch }),
   pan: (dx, dy) => { tx -= dx; ty -= dy; clampView(); render(); },
   zoomAt, fit: () => { fitWidth(); render(); }, nextPage, prevPage,
-  perf: () => ({ tileCacheMB: +(tileBytes / 1048576).toFixed(1), tiles: tileCache.size, previews: previewCache.size, tileScale: +currentTileBucket.toFixed(3), dpr: +hiDpr().toFixed(2) }),
+  perf: () => ({ detailReady: !!detailState, detailScale: detailState ? +detailState.scale.toFixed(3) : 0, previews: previewCache.size, lastRenderMs }),
   zoom: (f) => { zoomAt(cw / 2, ch / 2, f); render(); },
   zoomTo: (target) => { zoomTo(target); render(); },
 
   prime: () => render(),
-  dbg: { render, page: () => page, previews: () => [...previewCache.keys()], tiles: () => [...tileCache.keys()] },
+  dbg: { render, page: () => page, previews: () => [...previewCache.keys()] },
 };
 
 /* drag & drop (desktop) */
@@ -721,12 +691,156 @@ stage.addEventListener('drop', (e) => {
   if (f) handleFile(f);
 });
 
+
+/* ---------------- home library ---------------- */
+
+function makeFileId() {
+  return (crypto && crypto.randomUUID) ? crypto.randomUUID() : 'f-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+}
+
+async function saveRecentFile(data, name, existingId = null) {
+  try {
+    const db = await idb();
+    const id = existingId || makeFileId();
+    const tx = db.transaction('files', 'readwrite');
+    const store = tx.objectStore('files');
+    const previous = await new Promise(resolve => {
+      const req = store.get(id);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+    });
+    store.put({
+      id, name, blob: new Blob([data], {type:'application/pdf'}),
+      favorite: !!(previous && previous.favorite),
+      openedAt: Date.now(), page: pageNum || 1
+    });
+    const allReq = store.getAll();
+    allReq.onsuccess = () => {
+      const recent = (allReq.result || [])
+        .filter(item => !item.favorite)
+        .sort((a,b)=>(b.openedAt||0)-(a.openedAt||0));
+      for (const stale of recent.slice(20)) store.delete(stale.id);
+    };
+    return id;
+  } catch (err) {
+    console.warn('library save failed', err);
+    return existingId;
+  }
+}
+
+async function getLibraryFiles() {
+  const db = await idb();
+  const tx = db.transaction('files', 'readonly');
+  const req = tx.objectStore('files').getAll();
+  return await new Promise(resolve => {
+    req.onsuccess = () => resolve((req.result || []).sort((a,b)=>(b.openedAt||0)-(a.openedAt||0)));
+    req.onerror = () => resolve([]);
+  });
+}
+
+async function renderHome() {
+  if (!homeList) return;
+  homeTitle.textContent = homeMode === 'favorites' ? '收藏' : '最近開啟';
+  document.getElementById('homeRecent').classList.toggle('active', homeMode === 'recent');
+  document.getElementById('homeFavorites').classList.toggle('active', homeMode === 'favorites');
+  homeList.replaceChildren();
+  const files = await getLibraryFiles();
+  const shown = homeMode === 'favorites' ? files.filter(f=>f.favorite) : files;
+  if (!shown.length) {
+    const empty = document.createElement('div');
+    empty.className = 'home-empty';
+    empty.textContent = homeMode === 'favorites' ? '未有收藏的 PDF' : '尚未開啟 PDF。可以選擇檔案，或從 WhatsApp 分享進來。';
+    homeList.appendChild(empty);
+    return;
+  }
+  for (const file of shown.slice(0, 30)) {
+    const item = document.createElement('article');
+    item.className = 'file-row';
+    const open = document.createElement('button');
+    open.className = 'file-open';
+    open.type = 'button';
+    const icon = document.createElement('span');
+    icon.className = 'file-icon';
+    icon.textContent = 'PDF';
+    const meta = document.createElement('span');
+    meta.className = 'file-meta';
+    const title = document.createElement('strong');
+    title.textContent = file.name || 'document.pdf';
+    const sub = document.createElement('small');
+    sub.textContent = new Date(file.openedAt || Date.now()).toLocaleString();
+    meta.append(title, sub);
+    open.append(icon, meta);
+    open.addEventListener('click', async () => {
+      if (!file.blob) return;
+      const buf = await file.blob.arrayBuffer();
+      await openPdf(new Uint8Array(buf), file.name, file.id);
+    });
+    const fav = document.createElement('button');
+    fav.className = 'file-favorite' + (file.favorite ? ' selected' : '');
+    fav.type = 'button';
+    fav.setAttribute('aria-label', file.favorite ? '取消收藏' : '加入收藏');
+    fav.textContent = file.favorite ? '★' : '☆';
+    fav.addEventListener('click', async () => {
+      const db = await idb();
+      const tx = db.transaction('files','readwrite');
+      const store = tx.objectStore('files');
+      const req = store.get(file.id);
+      req.onsuccess = () => {
+        const rec = req.result;
+        if (rec) { rec.favorite = !rec.favorite; store.put(rec); }
+      };
+      tx.oncomplete = renderHome;
+    });
+    item.append(open, fav);
+    homeList.appendChild(item);
+  }
+}
+
+function updateFavoriteButton() {
+  if (!currentFavoriteBtn) return;
+  currentFavoriteBtn.hidden = !pdf;
+  currentFavoriteBtn.textContent = '☆';
+  if (!currentFileId) return;
+  getLibraryFiles().then(files => {
+    const rec = files.find(f=>f.id===currentFileId);
+    currentFavoriteBtn.textContent = rec && rec.favorite ? '★' : '☆';
+    currentFavoriteBtn.classList.toggle('selected', !!(rec && rec.favorite));
+  });
+}
+
+async function toggleCurrentFavorite() {
+  if (!currentFileId) return;
+  const db = await idb();
+  const tx = db.transaction('files','readwrite');
+  const store = tx.objectStore('files');
+  const req = store.get(currentFileId);
+  req.onsuccess = () => {
+    const rec = req.result;
+    if (rec) { rec.favorite = !rec.favorite; store.put(rec); }
+  };
+  tx.oncomplete = updateFavoriteButton;
+}
+
+function closeReaderToHome() {
+  document.body.classList.remove('hide-chrome');
+  cancelHiRender();
+  stage.hidden = true;
+  topEl.hidden = true;
+  bottomEl.hidden = true;
+  homeEl.hidden = false;
+  renderHome();
+}
+
 /* ---------------- tiny idb ---------------- */
 
 function idb() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('pdf-zoom', 1);
-    req.onupgradeneeded = () => req.result.createObjectStore('kv');
+    const req = indexedDB.open('pdf-zoom', 2);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');
+      if (!db.objectStoreNames.contains('files')) db.createObjectStore('files', { keyPath: 'id' });
+    };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
@@ -916,7 +1030,9 @@ async function tryShared() {
       }
     } catch (e) { console.warn('url open failed', e); }
   }
-  await showSnapFirst();          // instant picture while the file is read
-  const ok = await restoreLast();
-  if (!ok && emptyEl.hidden === false) emptyEl.hidden = false;
+  // A normal app launch always starts on the library home screen.
+  stage.hidden = true;
+  topEl.hidden = true; bottomEl.hidden = true;
+  homeEl.hidden = false;
+  await renderHome();
 })();
