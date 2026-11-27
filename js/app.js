@@ -299,7 +299,13 @@ async function renderDetail() {
   const pageViewport = pageRef.getViewport({ scale: 1 });
   const pageW = pageViewport.width, pageH = pageViewport.height;
   const bucket = quantizedScale();
-  const visible = viewPts();
+  const rawVisible = viewPts();
+  const visible = {
+    x0: Math.max(0, Math.min(pageW, rawVisible.x0)),
+    y0: Math.max(0, Math.min(pageH, rawVisible.y0)),
+    w: Math.max(1, Math.min(pageW, rawVisible.x0 + rawVisible.w) - Math.max(0, rawVisible.x0)),
+    h: Math.max(1, Math.min(pageH, rawVisible.y0 + rawVisible.h) - Math.max(0, rawVisible.y0)),
+  };
 
   // Render the visible area plus a generous pan buffer, not the entire sheet.
   // This keeps raster resolution high even on huge engineering drawings.
@@ -329,7 +335,7 @@ async function renderDetail() {
       Math.sqrt(MAX_DETAIL_PIXELS / Math.max(1, tileW * tileH * baseScale * baseScale)),
       MAX_DETAIL_DIMENSION / Math.max(1, tileW * baseScale),
       MAX_DETAIL_DIMENSION / Math.max(1, tileH * baseScale));
-    outputScale = Math.max(0.1, outputScale);
+    outputScale = Math.max(0.001, outputScale);
     const renderScale = baseScale * outputScale;
 
     const pixelW = Math.max(1, Math.ceil(tileW * renderScale));
