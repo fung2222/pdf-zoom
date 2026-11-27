@@ -105,10 +105,17 @@ const MAX_PREVIEW_PIXELS = 1.2e6;
 const previewCache = new Map();
 const tileCache = new Map();
 let tileBytes = 0;
+// A full-page low-resolution backing image stays visible throughout gestures.
+// It is transformed by the compositor while sharp tiles are rendered in the background.
+const previewLayer = document.createElement('canvas');
+previewLayer.id = 'previewLayer';
+previewLayer.style.cssText = 'position:absolute;left:0;top:0;pointer-events:none;transform-origin:0 0;will-change:transform;z-index:1;';
+stage.insertBefore(previewLayer, canvas.nextSibling);
+const previewCtx = previewLayer.getContext('2d', { alpha: false });
 let tileLayer = document.createElement('div');
 tileLayer.id = 'tileLayer';
-tileLayer.style.cssText = 'position:absolute;inset:0;overflow:visible;pointer-events:none;transform-origin:0 0;will-change:transform;z-index:1;';
-stage.insertBefore(tileLayer, canvas.nextSibling);
+tileLayer.style.cssText = 'position:absolute;inset:0;overflow:visible;pointer-events:none;transform-origin:0 0;will-change:transform;z-index:2;';
+stage.insertBefore(tileLayer, previewLayer.nextSibling);
 
 let activeTileTasks = new Set();
 let activeTileKeys = new Set();
@@ -134,6 +141,8 @@ function clearRenderCaches() {
   wantedTileKeys.clear();
   tileEpoch++;
   tileLayer.replaceChildren();
+  previewLayer.width = 1; previewLayer.height = 1;
+  previewLayer.style.display = 'none';
   if (canvas) {
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -175,11 +184,11 @@ function viewPts() {
 }
 
 function applyTransient() {
-  const k = s / rendered.s;
-  const dx = rendered.tx * k - tx;
-  const dy = rendered.ty * k - ty;
-  canvas.style.transform = `translate(${dx}px, ${dy}px) scale(${k})`;
-  tileLayer.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`;
+  // Never transform the viewport-sized canvas: it has no pixels outside the
+  // old viewport and therefore appears to vanish when pinching/panning.
+  const transform = `translate(${tx}px, ${ty}px) scale(${s})`;
+  previewLayer.style.transform = transform;
+  tileLayer.style.transform = transform;
 }
 
 function ensureCanvas(dpr) {
@@ -261,17 +270,20 @@ async function ensurePreview(n) {
 }
 
 function blitFrame(f) {
-  ensureCanvas(1);
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'high';
-  const v = viewPts();
-  const sx = v.x0 * f.s, sy = v.y0 * f.s;
-  const sw = v.w * f.s, sh = v.h * f.s;
-  ctx.drawImage(f.cv, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
-  rendered = { s, tx, ty, page: pageNum };
-  canvas.style.transform = 'none';
+  if (!page || !f || !f.cv) return;
+  const vp = page.getViewport({ scale: 1 });
+  previewLayer.width = f.cv.width;
+  previewLayer.height = f.cv.height;
+  previewLayer.style.width = vp.width + 'px';
+  previewLayer.style.height = vp.height + 'px';
+  previewCtx.setTransform(1, 0, 0, 1, 0, 0);
+  previewCtx.clearRect(0, 0, previewLayer.width, previewLayer.height);
+  previewCtx.imageSmoothingEnabled = true;
+  previewCtx.imageSmoothingQuality = 'high';
+  previewCtx.drawImage(f.cv, 0, 0);
+  previewLayer.style.display = 'block';
+  canvas.style.display = 'none';
+  applyTransient();
 }
 
 function trimTileCache() {
@@ -305,6 +317,7 @@ function paintWantedTiles() {
   desired.sort((a,b)=>a.distance-b.distance);
   wantedTileKeys = new Set(desired.map(t=>t.key));
   tileLayer.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`;
+  previewLayer.style.transform = tileLayer.style.transform;
   const keep = new Set();
   for (const item of desired) {
     let tile = tileCache.get(item.key);
@@ -775,6 +788,8 @@ async function restoreLast() {
     topEl.hidden = false; bottomEl.hidden = false; pgLabel.hidden = false; fitBtn.hidden = false;
     emptyEl.hidden = true;
     lastFile = { name: val.name };
+    const preview = await ensurePreview(pageNum);
+    if (preview) blitFrame(preview);
     await render();
     showChrome();
     return true;
