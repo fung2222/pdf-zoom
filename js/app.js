@@ -41,6 +41,8 @@ let fitScale = 1;
 let renderTask = null;
 let primeGeneration = 0;
 let lastRenderMs = 0;
+let lastVisibleRenderMs = 0;
+let lastRefineRenderMs = 0;
 let rafPending = false;
 let panRaf = false;
 let gestureActive = false;
@@ -279,34 +281,21 @@ async function renderDetail() {
   const bucket = quantizedScale();
   if (detailAreaCovers(visibleArea, bucket)) return;
 
+  // Stage 1: make only the currently visible area sharp as quickly as possible.
+  // Stage 2: expand the sharp area in the background after the browser has painted stage 1.
   const visiblePixels = Math.max(1, cw * ch * Math.pow(Math.min(window.devicePixelRatio || 1, 2), 2));
   const maxLinearRatio = Math.sqrt(MAX_DETAIL_PIXELS / visiblePixels);
   const overflow = Math.max(0, Math.min(1, (maxLinearRatio - 1) / 2));
   const extraX = visibleArea.w * overflow;
   const extraY = visibleArea.h * overflow;
-  const x0 = Math.max(0, visibleArea.x0 - extraX);
-  const y0 = Math.max(0, visibleArea.y0 - extraY);
-  const x1 = Math.min(pageW, visibleArea.x0 + visibleArea.w + extraX);
-  const y1 = Math.min(pageH, visibleArea.y0 + visibleArea.h + extraY);
-  const areaW = Math.max(1, x1 - x0);
-  const areaH = Math.max(1, y1 - y0);
-
-  let outputScale = Math.min(window.devicePixelRatio || 1, 2);
-  outputScale = Math.min(outputScale,
-    Math.sqrt(MAX_DETAIL_PIXELS / Math.max(1, areaW * areaH * bucket * bucket)));
-  outputScale = Math.min(outputScale,
-    MAX_DETAIL_DIMENSION / Math.max(1, areaW * bucket),
-    MAX_DETAIL_DIMENSION / Math.max(1, areaH * bucket));
-  outputScale = Math.max(0.5, outputScale);
-
-  const pixelW = Math.max(1, Math.ceil(areaW * bucket * outputScale));
-  const pixelH = Math.max(1, Math.ceil(areaH * bucket * outputScale));
-  const nextCanvas = document.createElement('canvas');
-  nextCanvas.className = 'detail-canvas';
-  nextCanvas.width = pixelW;
-  nextCanvas.height = pixelH;
-  nextCanvas.style.cssText =
-    `position:absolute;left:${x0}px;top:${y0}px;width:${areaW}px;height:${areaH}px;max-width:none;max-height:none;`;
+  const expandedArea = {
+    x0: Math.max(0, visibleArea.x0 - extraX),
+    y0: Math.max(0, visibleArea.y0 - extraY),
+    x1: Math.min(pageW, visibleArea.x0 + visibleArea.w + extraX),
+    y1: Math.min(pageH, visibleArea.y0 + visibleArea.h + extraY),
+  };
+  expandedArea.w = Math.max(1, expandedArea.x1 - expandedArea.x0);
+  expandedArea.h = Math.max(1, expandedArea.y1 - expandedArea.y0);
 
   const token = ++detailGeneration;
   if (detailTask) {
@@ -314,37 +303,86 @@ async function renderDetail() {
     detailTask = null;
   }
 
-  const viewport = pageRef.getViewport({ scale: bucket * outputScale });
-  const transform = [1, 0, 0, 1, -x0 * bucket * outputScale, -y0 * bucket * outputScale];
-  const started = performance.now();
-  const task = pageRef.render({
-    canvasContext: nextCanvas.getContext('2d', { alpha: false }),
-    viewport,
-    transform,
-    intent: 'display',
-  });
-  detailTask = task;
-  try {
-    await task.promise;
+  async function renderArea(area, phase) {
     if (token !== detailGeneration || doc !== pdf || pageRef !== page ||
-        pageNo !== pageNum || generation !== documentGeneration) {
-      nextCanvas.width = 0; nextCanvas.height = 0;
-      return;
+        pageNo !== pageNum || generation !== documentGeneration) return false;
+
+    let outputScale = Math.min(window.devicePixelRatio || 1, 2);
+    outputScale = Math.min(outputScale,
+      Math.sqrt(MAX_DETAIL_PIXELS / Math.max(1, area.w * area.h * bucket * bucket)));
+    outputScale = Math.min(outputScale,
+      MAX_DETAIL_DIMENSION / Math.max(1, area.w * bucket),
+      MAX_DETAIL_DIMENSION / Math.max(1, area.h * bucket));
+    outputScale = Math.max(0.5, outputScale);
+
+    const pixelW = Math.max(1, Math.ceil(area.w * bucket * outputScale));
+    const pixelH = Math.max(1, Math.ceil(area.h * bucket * outputScale));
+    const nextCanvas = document.createElement('canvas');
+    nextCanvas.className = 'detail-canvas';
+    nextCanvas.width = pixelW;
+    nextCanvas.height = pixelH;
+    nextCanvas.style.cssText =
+      `position:absolute;left:${area.x0}px;top:${area.y0}px;width:${area.w}px;height:${area.h}px;max-width:none;max-height:none;`;
+
+    const viewport = pageRef.getViewport({ scale: bucket * outputScale });
+    const transform = [1, 0, 0, 1, -area.x0 * bucket * outputScale, -area.y0 * bucket * outputScale];
+    const started = performance.now();
+    const task = pageRef.render({
+      canvasContext: nextCanvas.getContext('2d', { alpha: false }),
+      viewport,
+      transform,
+      intent: 'display',
+    });
+    detailTask = task;
+    try {
+      await task.promise;
+      if (token !== detailGeneration || doc !== pdf || pageRef !== page ||
+          pageNo !== pageNum || generation !== documentGeneration) {
+        nextCanvas.width = 0;
+        nextCanvas.height = 0;
+        return false;
+      }
+
+      const previousCanvas = detailState && detailState.canvas;
+      detailLayer.replaceChildren(nextCanvas);
+      if (previousCanvas && previousCanvas !== nextCanvas) {
+        previousCanvas.width = 0;
+        previousCanvas.height = 0;
+      }
+      detailState = {
+        canvas: nextCanvas,
+        x: area.x0, y: area.y0, w: area.w, h: area.h,
+        scale: bucket,
+      };
+      lastRenderMs = Math.round(performance.now() - started);
+      if (phase === 'visible') lastVisibleRenderMs = lastRenderMs;
+      else lastRefineRenderMs = lastRenderMs;
+      applyTransient();
+      return true;
+    } catch (err) {
+      nextCanvas.width = 0;
+      nextCanvas.height = 0;
+      if (err && err.name !== 'RenderingCancelledException') {
+        console.warn('Detail render failed', err);
+      }
+      return false;
+    } finally {
+      if (detailTask === task) detailTask = null;
     }
-    detailLayer.replaceChildren(nextCanvas);
-    if (detailState && detailState.canvas) {
-      detailState.canvas.width = 0;
-      detailState.canvas.height = 0;
-    }
-    detailState = { canvas: nextCanvas, x: x0, y: y0, w: areaW, h: areaH, scale: bucket };
-    lastRenderMs = Math.round(performance.now() - started);
-    applyTransient();
-  } catch (err) {
-    nextCanvas.width = 0; nextCanvas.height = 0;
-    if (err && err.name !== 'RenderingCancelledException') console.warn('Detail render failed', err);
-  } finally {
-    if (detailTask === task) detailTask = null;
   }
+
+  if (!await renderArea(visibleArea, 'visible')) return;
+
+  // Give the browser a paint opportunity so the visible high-resolution layer
+  // is not held back by the larger background render.
+  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  if (token !== detailGeneration || gestureActive) return;
+
+  const sameArea = Math.abs(expandedArea.x0 - visibleArea.x0) < 0.5 &&
+    Math.abs(expandedArea.y0 - visibleArea.y0) < 0.5 &&
+    Math.abs(expandedArea.w - visibleArea.w) < 0.5 &&
+    Math.abs(expandedArea.h - visibleArea.h) < 0.5;
+  if (!sameArea) await renderArea(expandedArea, 'refine');
 }
 
 function scheduleDetailRender(immediate = false) {
@@ -680,7 +718,7 @@ window.__pz = {
   state: () => ({ s, tx, ty, fitScale, pageNum, pageCount, cw, ch }),
   pan: (dx, dy) => { tx -= dx; ty -= dy; clampView(); render(); },
   zoomAt, fit: () => { fitWidth(); render(); }, nextPage, prevPage,
-  perf: () => ({ detailReady: !!detailState, detailScale: detailState ? +detailState.scale.toFixed(3) : 0, previews: previewCache.size, lastRenderMs }),
+  perf: () => ({ detailReady: !!detailState, detailScale: detailState ? +detailState.scale.toFixed(3) : 0, previews: previewCache.size, lastRenderMs, lastVisibleRenderMs, lastRefineRenderMs }),
   zoom: (f) => { zoomAt(cw / 2, ch / 2, f); render(); },
   zoomTo: (target) => { zoomTo(target); render(); },
 
