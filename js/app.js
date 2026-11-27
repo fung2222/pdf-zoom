@@ -160,7 +160,7 @@ let hiTimer = null;
 
 function tileScale() {
   // Quantized scale avoids rerendering for tiny pinch fluctuations.
-  return Math.pow(2, Math.round(Math.log2(Math.max(s, 0.001)) * 4) / 4);
+  return Math.pow(2, Math.round(Math.log2(Math.max(s, 0.001)) * 8) / 8);
 }
 
 function hiDpr() { return tileDpr(); }
