@@ -42,6 +42,7 @@ let renderTask = null;
 let primeGeneration = 0;
 let lastRenderMs = 0;
 let rafPending = false;
+let panRaf = false;
 let gestureActive = false;
 let lastFile = null;
 
@@ -113,7 +114,7 @@ function zoomTo(nextS, clientX = cw / 2, clientY = ch / 2) {
 
 const MAX_DETAIL_PIXELS = 8 * 1024 * 1024;
 const MAX_DETAIL_DIMENSION = 8192;
-const MAX_PREVIEW_PIXELS = 1.2e6;
+const MAX_PREVIEW_PIXELS = 8e5;
 const previewCache = new Map();
 const previewLayer = document.createElement('canvas');
 previewLayer.id = 'previewLayer';
@@ -169,7 +170,7 @@ function viewPts() {
 }
 
 function applyTransient() {
-  const transform = `translate(${tx}px, ${ty}px) scale(${s})`;
+  const transform = `translate3d(${tx}px, ${ty}px, 0) scale(${s})`;
   previewLayer.style.transform = transform;
   detailLayer.style.transform = transform;
 }
@@ -198,7 +199,7 @@ async function ensurePreview(n) {
       (wasCurrentPage && (pageNum !== n || page !== currentPageRef))) return null;
   const vp1 = p.getViewport({ scale: 1 });
   const pw = vp1.width, ph = vp1.height;
-  const targetWidth = Math.min(1000, Math.max(640, cw * 1.2));
+  const targetWidth = Math.min(760, Math.max(480, cw * 0.9));
   const ps = Math.min(targetWidth / pw, Math.sqrt(MAX_PREVIEW_PIXELS / (pw * ph)));
   const vp = p.getViewport({ scale: ps });
   const off = document.createElement('canvas');
@@ -532,6 +533,7 @@ stage.addEventListener('wheel', (e) => {
 
 async function openPdf(data, name, existingFileId = null) {
   const openId = ++documentGeneration;
+  currentFileId = null;
   pageRequestId++;
   primeGeneration++;
   cancelHiRender();
@@ -568,11 +570,16 @@ async function openPdf(data, name, existingFileId = null) {
     stage.hidden = false;
     topEl.hidden = false; bottomEl.hidden = false;
     pgLabel.hidden = false; fitBtn.hidden = false;
-    currentFileId = await saveRecentFile(keep, lastFile.name, existingFileId);
-    lastFile.id = currentFileId;
-    await saveLast(keep, lastFile.name);
-    updateFavoriteButton();
     showChrome();
+    // Do not hold the first visible page behind IndexedDB writes.
+    void (async () => {
+      const savedId = await saveRecentFile(keep, lastFile.name, existingFileId);
+      if (openId !== documentGeneration) return;
+      currentFileId = savedId;
+      lastFile.id = savedId;
+      await saveLast(keep, lastFile.name);
+      if (openId === documentGeneration) updateFavoriteButton();
+    })();
   } catch (err) {
     if (openId === documentGeneration) {
       console.error(err);
