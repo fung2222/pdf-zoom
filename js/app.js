@@ -241,6 +241,7 @@ function blitFrame(frame) {
 function detailAreaCovers(visible, bucket) {
   if (!detailState || Math.abs(detailState.scale - bucket) > 0.0001) return false;
   const d = detailState;
+  const pageViewport = page.getViewport({ scale: 1 });
   const right = d.x + d.w, bottom = d.y + d.h;
   if (visible.x0 < d.x || visible.y0 < d.y ||
       visible.x0 + visible.w > right || visible.y0 + visible.h > bottom) return false;
@@ -248,9 +249,12 @@ function detailAreaCovers(visible, bucket) {
   const rightPad = right - (visible.x0 + visible.w);
   const topPad = visible.y0 - d.y;
   const bottomPad = bottom - (visible.y0 + visible.h);
-  // Re-render before the user reaches the edge of the prepared high-res area.
-  return leftPad > visible.w * 0.5 && rightPad > visible.w * 0.5 &&
-         topPad > visible.h * 0.5 && bottomPad > visible.h * 0.5;
+  // At a physical page edge no extra margin is needed on that side.
+  const leftReady = d.x <= 0 || leftPad > visible.w * 0.5;
+  const rightReady = right >= pageViewport.width || rightPad > visible.w * 0.5;
+  const topReady = d.y <= 0 || topPad > visible.h * 0.5;
+  const bottomReady = bottom >= pageViewport.height || bottomPad > visible.h * 0.5;
+  return leftReady && rightReady && topReady && bottomReady;
 }
 
 async function renderDetail() {
