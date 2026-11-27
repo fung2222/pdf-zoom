@@ -51,7 +51,8 @@ function toggleTheme() {
 }
 try { applyTheme(localStorage.getItem('pdf-zoom-theme') || 'dark'); } catch { applyTheme('dark'); }
 
-const MAX_SCALE = 30;          // 30 CSS px per PDF point ≈ 3000% print — plenty for site drawings
+const MAX_ZOOM_RATIO = 40;     // 4000% relative to fit-to-width
+function maxScale() { return fitScale * MAX_ZOOM_RATIO; }
 const DPR = () => Math.min(window.devicePixelRatio || 1, 3);
 
 let pdf = null;
@@ -128,7 +129,7 @@ function stagePoint(clientX, clientY) {
 
 function zoomAt(clientX, clientY, factor) {
   const p = stagePoint(clientX, clientY);
-  const ns = Math.min(MAX_SCALE, Math.max(fitScale * 0.8, s * factor));
+  const ns = Math.min(maxScale(), Math.max(fitScale * 0.8, s * factor));
   const k = ns / s;
   // Keep the PDF point beneath the fingers anchored beneath the same point.
   tx = p.x - (p.x - tx) * k;
@@ -298,42 +299,59 @@ async function renderDetail() {
   const pageViewport = pageRef.getViewport({ scale: 1 });
   const pageW = pageViewport.width, pageH = pageViewport.height;
   const bucket = quantizedScale();
+  const rawVisible = viewPts();
+  const visible = {
+    x0: Math.max(0, Math.min(pageW, rawVisible.x0)),
+    y0: Math.max(0, Math.min(pageH, rawVisible.y0)),
+    w: Math.max(1, Math.min(pageW, rawVisible.x0 + rawVisible.w) - Math.max(0, rawVisible.x0)),
+    h: Math.max(1, Math.min(pageH, rawVisible.y0 + rawVisible.h) - Math.max(0, rawVisible.y0)),
+  };
 
-  // Render the entire page at the settled zoom level. Once ready, panning
-  // stays inside this full-page canvas and does not trigger more PDF renders.
-  if (detailAreaCovers({ x0: 0, y0: 0, w: pageW, h: pageH }, bucket)) return;
+  // Render the visible area plus a generous pan buffer, not the entire sheet.
+  // This keeps raster resolution high even on huge engineering drawings.
+  if (detailAreaCovers(visible, bucket)) return;
+
+  const padX = visible.w * 0.75;
+  const padY = visible.h * 0.75;
+  const x0 = Math.max(0, visible.x0 - padX);
+  const y0 = Math.max(0, visible.y0 - padY);
+  const x1 = Math.min(pageW, visible.x0 + visible.w + padX);
+  const y1 = Math.min(pageH, visible.y0 + visible.h + padY);
+  const tileW = Math.max(1, x1 - x0);
+  const tileH = Math.max(1, y1 - y0);
 
   const token = ++detailGeneration;
   if (detailTask) {
     try { detailTask.cancel(); } catch {}
     detailTask = null;
   }
-  beginLoading('正在載入清晰畫面');
+  beginLoading('正在載入高清區域');
 
   const started = performance.now();
   let nextCanvas = null;
   try {
-    let outputScale = Math.min(window.devicePixelRatio || 1, 2);
-    outputScale = Math.min(outputScale,
-      Math.sqrt(MAX_DETAIL_PIXELS / Math.max(1, pageW * pageH * bucket * bucket)));
-    outputScale = Math.min(outputScale,
-      MAX_DETAIL_DIMENSION / Math.max(1, pageW * bucket),
-      MAX_DETAIL_DIMENSION / Math.max(1, pageH * bucket));
-    outputScale = Math.max(0.05, outputScale);
+    const baseScale = bucket * DPR();
+    let outputScale = Math.min(1,
+      Math.sqrt(MAX_DETAIL_PIXELS / Math.max(1, tileW * tileH * baseScale * baseScale)),
+      MAX_DETAIL_DIMENSION / Math.max(1, tileW * baseScale),
+      MAX_DETAIL_DIMENSION / Math.max(1, tileH * baseScale));
+    outputScale = Math.max(0.001, outputScale);
+    const renderScale = baseScale * outputScale;
 
-    const pixelW = Math.max(1, Math.ceil(pageW * bucket * outputScale));
-    const pixelH = Math.max(1, Math.ceil(pageH * bucket * outputScale));
+    const pixelW = Math.max(1, Math.ceil(tileW * renderScale));
+    const pixelH = Math.max(1, Math.ceil(tileH * renderScale));
     nextCanvas = document.createElement('canvas');
     nextCanvas.className = 'detail-canvas';
     nextCanvas.width = pixelW;
     nextCanvas.height = pixelH;
     nextCanvas.style.cssText =
-      `position:absolute;left:0;top:0;width:${pageW}px;height:${pageH}px;max-width:none;max-height:none;`;
+      `position:absolute;left:${x0}px;top:${y0}px;width:${tileW}px;height:${tileH}px;max-width:none;max-height:none;`;
 
-    const viewport = pageRef.getViewport({ scale: bucket * outputScale });
+    const viewport = pageRef.getViewport({ scale: renderScale });
     const task = pageRef.render({
       canvasContext: nextCanvas.getContext('2d', { alpha: false }),
       viewport,
+      transform: [1, 0, 0, 1, -x0 * renderScale, -y0 * renderScale],
       intent: 'display',
     });
     detailTask = task;
@@ -352,7 +370,7 @@ async function renderDetail() {
       previousCanvas.width = 0;
       previousCanvas.height = 0;
     }
-    detailState = { canvas: nextCanvas, x: 0, y: 0, w: pageW, h: pageH, scale: bucket };
+    detailState = { canvas: nextCanvas, x: x0, y: y0, w: tileW, h: tileH, scale: bucket };
     lastRenderMs = Math.round(performance.now() - started);
     lastVisibleRenderMs = lastRenderMs;
     lastRefineRenderMs = 0;
@@ -360,7 +378,7 @@ async function renderDetail() {
   } catch (err) {
     if (nextCanvas) { nextCanvas.width = 0; nextCanvas.height = 0; }
     if (err && err.name !== 'RenderingCancelledException') {
-      console.warn('Full-page detail render failed', err);
+      console.warn('Tiled detail render failed', err);
     }
   } finally {
     if (detailTask && token === detailGeneration) detailTask = null;
@@ -491,7 +509,7 @@ stage.addEventListener('pointermove', (e) => {
     moved = 99;
     const factor = dist / Math.max(12, pinchStart.dist);
     // Keep the PDF point under the initial pinch midpoint under the moving midpoint.
-    const ns = Math.min(MAX_SCALE, Math.max(fitScale * 0.8, pinchStart.s * factor));
+    const ns = Math.min(maxScale(), Math.max(fitScale * 0.8, pinchStart.s * factor));
     const k = ns / pinchStart.s;
     tx = cx - (pinchStart.cx - pinchStart.tx) * k;
     ty = cy - (pinchStart.cy - pinchStart.ty) * k;
@@ -918,7 +936,7 @@ function saveLastPos(n) {
 function applySavedView(view) {
   if (!view || !view.z) return;
   const { w, h } = pageSize();
-  s = Math.min(MAX_SCALE, Math.max(fitScale, fitScale * view.z));
+  s = Math.min(maxScale(), Math.max(fitScale, fitScale * view.z));
   tx = (view.fx || 0.5) * w * s - cw / 2;
   ty = (view.fy || 0.5) * h * s - ch / 2;
   clampView();
