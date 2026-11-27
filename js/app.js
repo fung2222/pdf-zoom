@@ -592,6 +592,8 @@ async function openPdf(data, name, existingFileId = null) {
   pageRequestId++;
   primeGeneration++;
   cancelHiRender();
+  homeEl.hidden = true;
+  stage.hidden = false;
   spinner.hidden = false;
   emptyEl.hidden = true;
   // pdf.js TRANSFERS the buffer to its worker, so keep a copy for IndexedDB first
@@ -782,6 +784,8 @@ async function getLibraryFiles() {
 async function renderHome() {
   if (!homeList) return;
   homeTitle.textContent = homeMode === 'favorites' ? '收藏' : '最近開啟';
+  document.getElementById('homeRecent').classList.toggle('active', homeMode === 'recent');
+  document.getElementById('homeFavorites').classList.toggle('active', homeMode === 'favorites');
   homeList.replaceChildren();
   const files = await getLibraryFiles();
   const shown = homeMode === 'favorites' ? files.filter(f=>f.favorite) : files;
