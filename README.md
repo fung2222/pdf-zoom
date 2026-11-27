@@ -11,3 +11,7 @@
 
 ## 部署
 純靜態，任何 static host 都得（GitHub Pages / Netlify / 自己 server）。
+
+## 開發及上架交接
+
+- [Google Play 上架交接清單、目前架構、效能優化路線及測試表](GOOGLE-PLAY-HANDOFF.md)
