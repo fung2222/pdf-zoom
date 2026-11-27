@@ -111,6 +111,7 @@ tileLayer.style.cssText = 'position:absolute;inset:0;overflow:visible;pointer-ev
 stage.insertBefore(tileLayer, canvas.nextSibling);
 
 let activeTileTasks = new Set();
+let activeTileKeys = new Set();
 let tileQueue = [];
 let tileWorkers = 0;
 let wantedTileKeys = new Set();
@@ -323,7 +324,7 @@ function paintWantedTiles() {
 }
 
 function enqueueTile(item) {
-  if (tileQueue.some(job => job.key === item.key) || tileCache.has(item.key)) return;
+  if (tileQueue.some(job => job.key === item.key) || activeTileKeys.has(item.key) || tileCache.has(item.key)) return;
   tileQueue.push({...item, epoch: tileEpoch, generation: documentGeneration, pageNo: pageNum, bucket: currentTileBucket, dpr: currentTileDpr});
   tileQueue.sort((a,b)=>a.distance-b.distance);
 }
@@ -355,6 +356,7 @@ async function renderTile(job) {
   cv.width = pixelW; cv.height = pixelH;
   cv.style.cssText = `position:absolute;left:${x0}px;top:${y0}px;width:${w}px;height:${h}px;max-width:none;max-height:none;`;
   const viewport = pageRef.getViewport({scale:job.bucket * job.dpr});
+  activeTileKeys.add(job.key);
   const task = pageRef.render({
     canvasContext: cv.getContext('2d', {alpha:false}),
     viewport,
@@ -377,6 +379,7 @@ async function renderTile(job) {
     if (err && err.name !== 'RenderingCancelledException') console.warn('Tile render failed', err);
   } finally {
     activeTileTasks.delete(task);
+    activeTileKeys.delete(job.key);
   }
 }
 
@@ -586,7 +589,6 @@ async function openPdf(data, name) {
     topEl.hidden = false; bottomEl.hidden = false;
     pgLabel.hidden = false; fitBtn.hidden = false;
     lastFile = { name: name || 'document.pdf' };
-    if (typeof refreshInstallUI === 'function') refreshInstallUI();
     await saveLast(keep, lastFile.name);
     showChrome();
   } catch (err) {
@@ -672,92 +674,6 @@ window.addEventListener('keydown', (e) => {
   if (e.key === '-') { zoomAt(cw / 2, ch / 2, 1 / 1.4); render(); }
   if (e.key === '0') { fitWidth(); render(); }
 });
-
-/* ---------------- install to home screen ---------------- */
-
-const installFab = document.getElementById('installFab');
-const sheet = document.getElementById('sheet');
-const sheetTitle = document.getElementById('sheetTitle');
-const sheetSteps = document.getElementById('sheetSteps');
-const sheetClose = document.getElementById('sheetClose');
-
-let deferredPrompt = null;
-
-const isStandalone = () =>
-  window.matchMedia('(display-mode: standalone)').matches ||
-  window.matchMedia('(display-mode: fullscreen)').matches ||
-  window.navigator.standalone === true;
-
-const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) ||
-  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-
-const installInline = document.getElementById('installInline');
-
-function refreshInstallUI() {
-  const standalone = isStandalone();
-  const emptyShown = !emptyEl.hidden;
-  installFab.hidden = standalone || emptyShown;      // floating pill only while reading
-  installInline.hidden = standalone || !emptyShown;  // inline link on the empty screen
-}
-
-function showInstallPill() {
-  refreshInstallUI();
-}
-
-function manualSteps() {
-  if (isIOS()) {
-    return { title: '加到主畫面（iPhone）', steps: [
-      '撳下面 Safari 個「分享」圖示（正方框＋向上箭頭）',
-      '揀「加入主畫面」',
-      '右上撳「加入」',
-      '主畫面就會出現 PDF 圖示',
-    ] };
-  }
-  return { title: '加到主畫面（Android）', steps: [
-    '要喺 Chrome 開呢個網頁（唔好用 Telegram／IG 內建瀏覽器）',
-    '撳 Chrome 右上 ⋮',
-    '揀「安裝應用程式」（舊版叫「加到主畫面」）',
-    '再撳「安裝」',
-  ] };
-}
-
-function openSheet() {
-  const m = manualSteps();
-  sheetTitle.textContent = m.title;
-  sheetSteps.innerHTML = m.steps.map((s) => `<li>${s}</li>`).join('');
-  sheet.hidden = false;
-}
-sheetClose.addEventListener('click', () => { sheet.hidden = true; showChrome(); });
-sheet.addEventListener('click', (e) => { if (e.target === sheet) sheet.hidden = true; });
-
-window.addEventListener('beforeinstallprompt', (e) => {
-  e.preventDefault();
-  deferredPrompt = e;
-  showInstallPill();
-});
-
-window.addEventListener('appinstalled', () => {
-  deferredPrompt = null;
-  installFab.hidden = true;
-  sheet.hidden = true;
-});
-
-async function handleInstallClick() {
-  if (deferredPrompt) {
-    try {
-      deferredPrompt.prompt();
-      const choice = await deferredPrompt.userChoice;
-      deferredPrompt = null;
-      if (choice && choice.outcome === 'accepted') { installFab.hidden = true; installInline.hidden = true; }
-      refreshInstallUI();
-      return;
-    } catch (err) { /* fall through to instructions */ }
-  }
-  openSheet();
-}
-
-installFab.addEventListener('click', handleInstallClick);
-installInline.addEventListener('click', handleInstallClick);
 
 /* debug/automation hook (harmless in production) */
 window.__pz = {
@@ -861,7 +777,6 @@ async function restoreLast() {
     emptyEl.hidden = true;
     lastFile = { name: val.name };
     await render();
-    if (typeof refreshInstallUI === 'function') refreshInstallUI();
     showChrome();
     return true;
   } catch (e) {
