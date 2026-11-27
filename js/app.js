@@ -680,7 +680,6 @@ window.__pz = {
   state: () => ({ s, tx, ty, fitScale, pageNum, pageCount, cw, ch }),
   pan: (dx, dy) => { tx -= dx; ty -= dy; clampView(); render(); },
   zoomAt, fit: () => { fitWidth(); render(); }, nextPage, prevPage,
-  install: { hasPrompt: () => !!deferredPrompt, fab: () => !installFab.hidden, standalone: isStandalone, sheet: () => openSheet() },
   perf: () => ({ tileCacheMB: +(tileBytes / 1048576).toFixed(1), tiles: tileCache.size, previews: previewCache.size, tileScale: +currentTileBucket.toFixed(3), dpr: +hiDpr().toFixed(2) }),
   zoom: (f) => { zoomAt(cw / 2, ch / 2, f); render(); },
   zoomTo: (target) => { zoomTo(target); render(); },
