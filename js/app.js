@@ -83,11 +83,18 @@ function fitWidth(keepY = false) {
   clampView();
 }
 
+function stagePoint(clientX, clientY) {
+  const rect = stage.getBoundingClientRect();
+  return { x: clientX - rect.left, y: clientY - rect.top };
+}
+
 function zoomAt(clientX, clientY, factor) {
+  const p = stagePoint(clientX, clientY);
   const ns = Math.min(MAX_SCALE, Math.max(fitScale * 0.8, s * factor));
   const k = ns / s;
-  tx = (tx + clientX) * k - clientX;
-  ty = (ty + clientY) * k - clientY;
+  // Keep the PDF point beneath the fingers anchored beneath the same point.
+  tx = p.x - (p.x - tx) * k;
+  ty = p.y - (p.y - ty) * k;
   s = ns;
   clampView();
 }
@@ -481,10 +488,11 @@ stage.addEventListener('pointerdown', (e) => {
     pinchStart = null;
   } else if (pointers.size === 2) {
     const [a, b] = [...pointers.values()];
+    const rect = stage.getBoundingClientRect();
     pinchStart = {
       dist: Math.hypot(a.x - b.x, a.y - b.y),
-      cx: (a.x + b.x) / 2,
-      cy: (a.y + b.y) / 2,
+      cx: (a.x + b.x) / 2 - rect.left,
+      cy: (a.y + b.y) / 2 - rect.top,
       s, tx, ty,
     };
     dragStart = null;
@@ -498,22 +506,24 @@ stage.addEventListener('pointermove', (e) => {
   if (pointers.size === 1 && dragStart) {
     const dx = e.clientX - dragStart.x, dy = e.clientY - dragStart.y;
     moved = Math.max(moved, Math.hypot(dx, dy));
-    tx = dragStart.tx - dx;
-    ty = dragStart.ty - dy;
+    // The drawing must follow the finger.
+    tx = dragStart.tx + dx;
+    ty = dragStart.ty + dy;
     clampView();
     schedulePaint();
   } else if (pointers.size === 2 && pinchStart) {
     const [a, b] = [...pointers.values()];
     const dist = Math.hypot(a.x - b.x, a.y - b.y);
-    const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+    const rect = stage.getBoundingClientRect();
+    const cx = (a.x + b.x) / 2 - rect.left;
+    const cy = (a.y + b.y) / 2 - rect.top;
     moved = 99;
     const factor = dist / Math.max(12, pinchStart.dist);
-    // rebuild from gesture start so pinch feels stable
-    tx = pinchStart.tx; ty = pinchStart.ty; s = pinchStart.s;
+    // Keep the PDF point under the initial pinch midpoint under the moving midpoint.
     const ns = Math.min(MAX_SCALE, Math.max(fitScale * 0.8, pinchStart.s * factor));
-    const k = ns / s;
-    tx = (tx + pinchStart.cx) * k - cx;
-    ty = (ty + pinchStart.cy) * k - cy;
+    const k = ns / pinchStart.s;
+    tx = cx - (pinchStart.cx - pinchStart.tx) * k;
+    ty = cy - (pinchStart.cy - pinchStart.ty) * k;
     s = ns;
     clampView();
     schedulePaint();
