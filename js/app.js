@@ -6,7 +6,6 @@ const stage = document.getElementById('stage');
 const canvas = document.getElementById('view');
 const ctx = canvas.getContext('2d', { alpha: true });
 const emptyEl = document.getElementById('empty');
-const spinner = document.getElementById('spinner');
 const badge = document.getElementById('badge');
 const dropEl = document.getElementById('drop');
 const topEl = document.getElementById('top');
@@ -562,7 +561,6 @@ async function openPdf(data, name, existingFileId = null) {
   homeEl.hidden = true;
   stage.hidden = false;
   topEl.hidden = false;
-  spinner.hidden = false;
   beginLoading('正在開啟 PDF');
   emptyEl.hidden = true;
   // pdf.js TRANSFERS the buffer to its worker, so keep a copy for IndexedDB first
@@ -610,7 +608,6 @@ async function openPdf(data, name, existingFileId = null) {
       emptyEl.hidden = false;
     }
   } finally {
-    if (openId === documentGeneration) spinner.hidden = true;
     endLoading();
   }
 }
