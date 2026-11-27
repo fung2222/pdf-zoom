@@ -894,6 +894,4 @@ async function tryShared() {
   await showSnapFirst();          // instant picture while the file is read
   const ok = await restoreLast();
   if (!ok && emptyEl.hidden === false) emptyEl.hidden = false;
-  // always give an install entry point (native prompt when available, steps otherwise)
-  setTimeout(() => { showInstallPill(); }, 700);
 })();
