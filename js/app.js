@@ -51,7 +51,7 @@ function toggleTheme() {
 }
 try { applyTheme(localStorage.getItem('pdf-zoom-theme') || 'dark'); } catch { applyTheme('dark'); }
 
-const MAX_ZOOM_RATIO = 50;     // 5000% relative to fit-to-width
+const MAX_ZOOM_RATIO = 60;     // 6000% relative to fit-to-width
 function maxScale() { return fitScale * MAX_ZOOM_RATIO; }
 const DPR = () => Math.min(window.devicePixelRatio || 1, 3);
 
@@ -147,6 +147,15 @@ function zoomTo(nextS, clientX = cw / 2, clientY = ch / 2) {
 const MAX_DETAIL_PIXELS = 8 * 1024 * 1024;
 const MAX_DETAIL_DIMENSION = 8192;
 const MAX_PREVIEW_PIXELS = 8e5;
+const MAX_BUFFER_RATIO = 1.6;   // pan buffer: tile ≤ 1.6× visible per axis (stays inside pixel budget)
+const stats = { cancels: 0, gestureEndAt: 0, sharpAt: 0, sharpLatencyMs: 0, longTaskMax: 0 };
+try {
+  new PerformanceObserver((list) => {
+    for (const entry of list.getEntries()) {
+      stats.longTaskMax = Math.max(stats.longTaskMax, Math.round(entry.duration));
+    }
+  }).observe({ entryTypes: ['longtask'] });
+} catch {}
 const previewCache = new Map();
 const previewLayer = document.createElement('canvas');
 previewLayer.id = 'previewLayer';
@@ -191,7 +200,7 @@ function cancelHiRender() {
   detailRefineTimer = null;
   detailGeneration++;
   if (detailTask) {
-    try { detailTask.cancel(); } catch {}
+    try { detailTask.cancel(); stats.cancels++; } catch {}
     detailTask = null;
   }
 }
@@ -333,9 +342,16 @@ async function renderDetail({ buffered = false, showLoading = true } = {}) {
   }
 
   // First paint only the visible viewport for a fast sharp result.
-  // Then render a larger pan-buffer tile in the background.
-  const padX = buffered ? visible.w * 0.75 : 0;
-  const padY = buffered ? visible.h * 0.75 : 0;
+  // Then grow the pan buffer, but never past what the pixel budget can hold at
+  // full screen resolution: padding further used to render below s*DPR and
+  // replace a sharp canvas with a blurrier one.
+  const dpr = DPR();
+  const visiblePx = Math.max(1, visible.w * visible.h * bucket * bucket * dpr * dpr);
+  const bufferRatio = buffered
+    ? Math.min(MAX_BUFFER_RATIO, Math.max(1, Math.sqrt(MAX_DETAIL_PIXELS / visiblePx)))
+    : 1;
+  const padX = visible.w * (bufferRatio - 1) / 2;
+  const padY = visible.h * (bufferRatio - 1) / 2;
   const x0 = Math.max(0, visible.x0 - padX);
   const y0 = Math.max(0, visible.y0 - padY);
   const x1 = Math.min(pageW, visible.x0 + visible.w + padX);
@@ -354,7 +370,7 @@ async function renderDetail({ buffered = false, showLoading = true } = {}) {
   let nextCanvas = null;
   let renderedOk = false;
   try {
-    const baseScale = bucket * DPR();
+    const baseScale = bucket * dpr;
     let outputScale = Math.min(1,
       Math.sqrt(MAX_DETAIL_PIXELS / Math.max(1, tileW * tileH * baseScale * baseScale)),
       MAX_DETAIL_DIMENSION / Math.max(1, tileW * baseScale),
@@ -389,15 +405,32 @@ async function renderDetail({ buffered = false, showLoading = true } = {}) {
     }
 
     const previousCanvas = detailState && detailState.canvas;
+    const newPxPerPt = pixelW / tileW;
+    const oldPxPerPt = detailState && detailState.pxPerPt ? detailState.pxPerPt : 0;
+    if (detailState && Math.abs(detailState.scale - bucket) < 0.0001 &&
+        oldPxPerPt > newPxPerPt * 1.01 && detailContainsVisible(visible, bucket)) {
+      // What is already on screen is sharper than this pass: keep it.
+      nextCanvas.width = 0;
+      nextCanvas.height = 0;
+      return;
+    }
     detailLayer.replaceChildren(nextCanvas);
     if (previousCanvas && previousCanvas !== nextCanvas) {
       previousCanvas.width = 0;
       previousCanvas.height = 0;
     }
-    detailState = { canvas: nextCanvas, x: x0, y: y0, w: tileW, h: tileH, scale: bucket };
+    detailState = { canvas: nextCanvas, x: x0, y: y0, w: tileW, h: tileH, scale: bucket, pxPerPt: newPxPerPt };
     lastRenderMs = Math.round(performance.now() - started);
-    lastVisibleRenderMs = lastRenderMs;
-    lastRefineRenderMs = 0;
+    if (buffered) lastRefineRenderMs = lastRenderMs;
+    else {
+      lastVisibleRenderMs = lastRenderMs;
+      lastRefineRenderMs = 0;
+      stats.sharpAt = performance.now();
+      if (stats.gestureEndAt) {
+        stats.sharpLatencyMs = Math.round(stats.sharpAt - stats.gestureEndAt);
+        stats.gestureEndAt = 0;
+      }
+    }
     applyTransient();
     renderedOk = true;
   } catch (err) {
@@ -562,6 +595,8 @@ function endPointer(e) {
   }
   if (pointers.size === 0) {
     gestureActive = false;
+    stats.gestureEndAt = performance.now();
+    stats.sharpLatencyMs = 0;
     dragStart = null;
     pinchStart = null;
     const isTap = moved < 7 && lastFile !== null;
@@ -571,7 +606,7 @@ function endPointer(e) {
       if (dbl) {
         tapInfo.t = 0;
         const zoomedIn = s > fitScale * 1.9;
-        if (zoomedIn) { fitWidth(); render(); } else { zoomAt(e.clientX, e.clientY, 2.6); render(); }
+        if (zoomedIn) { fitWidth(); render({ immediate: true }); } else { zoomAt(e.clientX, e.clientY, 2.6); render({ immediate: true }); }
         flashZoom();
         return;
       }
@@ -737,17 +772,17 @@ currentFavoriteBtn.addEventListener('click', toggleCurrentFavorite);
 document.getElementById('pick').addEventListener('click', () => fileInput.click());
 document.getElementById('next').addEventListener('click', nextPage);
 document.getElementById('prev').addEventListener('click', prevPage);
-document.getElementById('zoomIn').addEventListener('click', () => { zoomAt(cw / 2, ch / 2, 1.5); render(); flashZoom(); });
-document.getElementById('zoomOut').addEventListener('click', () => { zoomAt(cw / 2, ch / 2, 1 / 1.5); render(); flashZoom(); });
-fitBtn.addEventListener('click', () => { fitWidth(); render(); flashZoom(); });
+document.getElementById('zoomIn').addEventListener('click', () => { zoomAt(cw / 2, ch / 2, 1.5); render({ immediate: true }); flashZoom(); });
+document.getElementById('zoomOut').addEventListener('click', () => { zoomAt(cw / 2, ch / 2, 1 / 1.5); render({ immediate: true }); flashZoom(); });
+fitBtn.addEventListener('click', () => { fitWidth(); render({ immediate: true }); flashZoom(); });
 
 window.addEventListener('keydown', (e) => {
   if (!pdf) return;
   if (e.key === 'ArrowRight' || e.key === 'PageDown') nextPage();
   if (e.key === 'ArrowLeft' || e.key === 'PageUp') prevPage();
-  if (e.key === '+' || e.key === '=') { zoomAt(cw / 2, ch / 2, 1.4); render(); }
-  if (e.key === '-') { zoomAt(cw / 2, ch / 2, 1 / 1.4); render(); }
-  if (e.key === '0') { fitWidth(); render(); }
+  if (e.key === '+' || e.key === '=') { zoomAt(cw / 2, ch / 2, 1.4); render({ immediate: true }); }
+  if (e.key === '-' || e.key === '_') { zoomAt(cw / 2, ch / 2, 1 / 1.4); render({ immediate: true }); }
+  if (e.key === '0') { fitWidth(); render({ immediate: true }); }
 });
 
 /* debug/automation hook (harmless in production) */
@@ -755,7 +790,31 @@ window.__pz = {
   state: () => ({ s, tx, ty, fitScale, pageNum, pageCount, cw, ch }),
   pan: (dx, dy) => { tx -= dx; ty -= dy; clampView(); render(); },
   zoomAt, fit: () => { fitWidth(); render(); }, nextPage, prevPage,
-  perf: () => ({ detailReady: !!detailState, detailScale: detailState ? +detailState.scale.toFixed(3) : 0, previews: previewCache.size, lastRenderMs, lastVisibleRenderMs, lastRefineRenderMs }),
+  perf: () => {
+    const canvases = detailLayer.querySelectorAll('canvas');
+    let mpx = 0;
+    canvases.forEach((c) => { mpx += (c.width * c.height) / 1e6; });
+    const needed = detailState ? detailState.scale * DPR() : 0;
+    return {
+      detailReady: !!detailState,
+      detailScale: detailState ? +detailState.scale.toFixed(3) : 0,
+      previews: previewCache.size,
+      lastRenderMs, lastVisibleRenderMs, lastRefineRenderMs,
+      canvasPx: detailState ? detailState.canvas.width + 'x' + detailState.canvas.height : null,
+      detailMpx: +mpx.toFixed(2),
+      detailCanvases: canvases.length,
+      sharpness: detailState && needed ? +((detailState.pxPerPt || 0) / needed).toFixed(2) : 0,
+      sharpLatencyMs: stats.sharpLatencyMs,
+      cancels: stats.cancels,
+      longTaskMaxMs: stats.longTaskMax,
+    };
+  },
+  benchReset: () => {
+    stats.cancels = 0; stats.longTaskMax = 0; stats.sharpLatencyMs = 0;
+    stats.gestureEndAt = 0; stats.sharpAt = 0;
+  },
+  buttonZoom: (f) => { zoomAt(cw / 2, ch / 2, f); render({ immediate: true }); },
+  gestureEnd: () => { stats.gestureEndAt = performance.now(); stats.sharpLatencyMs = 0; render({ immediate: true }); },
   zoom: (f) => { zoomAt(cw / 2, ch / 2, f); render(); },
   zoomTo: (target) => { zoomTo(target); render(); },
 
