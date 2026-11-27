@@ -148,7 +148,7 @@ const MAX_DETAIL_PIXELS = 8 * 1024 * 1024;
 const MAX_DETAIL_DIMENSION = 8192;
 const MAX_PREVIEW_PIXELS = 8e5;
 const MAX_BUFFER_RATIO = 1.6;   // pan buffer: tile ≤ 1.6× visible per axis (stays inside pixel budget)
-const stats = { cancels: 0, gestureEndAt: 0, sharpAt: 0, sharpLatencyMs: 0, longTaskMax: 0 };
+const stats = { cancels: 0, gestureEndAt: 0, sharpAt: 0, sharpLatencyMs: 0, longTaskMax: 0, cacheHits: 0 };
 try {
   new PerformanceObserver((list) => {
     for (const entry of list.getEntries()) {
@@ -168,6 +168,7 @@ detailLayer.style.cssText = 'position:absolute;inset:0;overflow:visible;pointer-
 stage.insertBefore(detailLayer, previewLayer.nextSibling);
 
 let detailState = null;
+let placeholderState = null;
 let detailTask = null;
 let detailTimer = null;
 let detailRefineTimer = null;
@@ -180,6 +181,9 @@ function releaseFrame(frame) {
 
 function clearRenderCaches() {
   cancelHiRender();
+  clearTileCache();
+  if (placeholderState) releaseFrame({ cv: placeholderState.canvas });
+  placeholderState = null;
   for (const frame of previewCache.values()) releaseFrame(frame);
   previewCache.clear();
   detailLayer.replaceChildren();
@@ -207,6 +211,81 @@ function cancelHiRender() {
 
 function quantizedScale() {
   return Math.pow(2, Math.round(Math.log2(Math.max(s, 0.001)) * 8) / 8);
+}
+
+/* -------- detail tile cache: pan back into a seen area without re-rendering -------- */
+
+const MAX_TILE_CACHE_PIXELS = 10 * 1024 * 1024;   // ≈ 3 sharp viewport tiles on a phone
+let tileCache = [];
+let tileCachePixels = 0;
+let tileBucket = 0;
+
+function clearTileCache() {
+  for (const tile of tileCache) releaseFrame({ cv: tile.canvas });
+  tileCache = [];
+  tileCachePixels = 0;
+}
+
+function cacheDetailTile(state) {
+  if (!state || !state.canvas) return;
+  // Only keep viewport-sized sharp tiles: a padded pan-buffer tile costs ~2.6×
+  // the pixels and would evict the small tiles that make pan-back instant.
+  if (state.buffered) return;
+  const pixels = state.canvas.width * state.canvas.height;
+  if (!pixels || pixels > MAX_TILE_CACHE_PIXELS) return;
+  for (let i = tileCache.length - 1; i >= 0; i--) {
+    if (tileCache[i].canvas === state.canvas) {
+      tileCachePixels -= tileCache[i].canvas.width * tileCache[i].canvas.height;
+      tileCache.splice(i, 1);
+    }
+  }
+  tileCache.push({
+    canvas: state.canvas, x: state.x, y: state.y, w: state.w, h: state.h,
+    scale: state.scale, pxPerPt: state.pxPerPt || 0,
+  });
+  tileCachePixels += pixels;
+  while (tileCachePixels > MAX_TILE_CACHE_PIXELS && tileCache.length > 1) {
+    const old = tileCache.shift();
+    tileCachePixels -= old.canvas.width * old.canvas.height;
+    releaseFrame({ cv: old.canvas });
+  }
+}
+
+function takeCachedTile(visible, bucket) {
+  const needed = bucket * DPR();
+  for (let i = tileCache.length - 1; i >= 0; i--) {
+    const tile = tileCache[i];
+    if (Math.abs(tile.scale - bucket) > 0.0001) continue;
+    if (tile.pxPerPt && tile.pxPerPt < needed * 0.95) continue;
+    if (visible.x0 < tile.x - 0.01 || visible.y0 < tile.y - 0.01 ||
+        visible.x0 + visible.w > tile.x + tile.w + 0.01 ||
+        visible.y0 + visible.h > tile.y + tile.h + 0.01) continue;
+    tileCache.splice(i, 1);
+    tileCachePixels -= tile.canvas.width * tile.canvas.height;
+    return tile;
+  }
+  return null;
+}
+
+// A cached tile that only overlaps part of the view is still worth showing as a
+// stand-in while the exact tile renders: the user sees sharp content at once.
+function takeOverlappingTile(visible, bucket) {
+  const needed = bucket * DPR();
+  let best = null, bestCover = 0;
+  for (const tile of tileCache) {
+    if (Math.abs(tile.scale - bucket) > 0.0001) continue;
+    if (tile.pxPerPt && tile.pxPerPt < needed * 0.95) continue;
+    const ox = Math.min(visible.x0 + visible.w, tile.x + tile.w) - Math.max(visible.x0, tile.x);
+    const oy = Math.min(visible.y0 + visible.h, tile.y + tile.h) - Math.max(visible.y0, tile.y);
+    if (ox <= 0 || oy <= 0) continue;
+    const cover = (ox * oy) / Math.max(1, visible.w * visible.h);
+    if (cover > bestCover) { bestCover = cover; best = tile; }
+  }
+  if (!best || bestCover < 0.25) return null;
+  const index = tileCache.indexOf(best);
+  tileCache.splice(index, 1);
+  tileCachePixels -= best.canvas.width * best.canvas.height;
+  return best;
 }
 
 function viewPts() {
@@ -327,6 +406,7 @@ async function renderDetail({ buffered = false, showLoading = true } = {}) {
   const pageViewport = pageRef.getViewport({ scale: 1 });
   const pageW = pageViewport.width, pageH = pageViewport.height;
   const bucket = quantizedScale();
+  if (Math.abs(bucket - tileBucket) > 0.0001) { clearTileCache(); tileBucket = bucket; }
   const rawVisible = viewPts();
   const visible = {
     x0: Math.max(0, Math.min(pageW, rawVisible.x0)),
@@ -339,6 +419,42 @@ async function renderDetail({ buffered = false, showLoading = true } = {}) {
   if (buffered ? detailAreaCovers(visible, bucket) : alreadyVisible) {
     if (!buffered && !detailAreaCovers(visible, bucket)) scheduleDetailRefine();
     return;
+  }
+
+  // Panning back into an area that was already rendered: put the cached tile on
+  // screen immediately instead of paying for another render.
+  if (!buffered) {
+    const cached = takeCachedTile(visible, bucket);
+    if (cached) {
+      stats.cacheHits++;
+      const previous = detailState;
+      detailLayer.replaceChildren(cached.canvas);
+      if (previous && previous.canvas && previous.canvas !== cached.canvas) cacheDetailTile(previous);
+      detailState = {
+        canvas: cached.canvas, x: cached.x, y: cached.y, w: cached.w, h: cached.h,
+        scale: cached.scale, pxPerPt: cached.pxPerPt, buffered: false,
+      };
+      lastRenderMs = 0;
+      lastVisibleRenderMs = 0;
+      lastRefineRenderMs = 0;
+      stats.sharpAt = performance.now();
+      if (stats.gestureEndAt) {
+        stats.sharpLatencyMs = Math.round(stats.sharpAt - stats.gestureEndAt);
+        stats.gestureEndAt = 0;
+      }
+      applyTransient();
+      return;
+    }
+
+    // Otherwise, if part of the view was rendered before, put that tile behind
+    // the current one so the overlap is sharp while the exact tile is drawn.
+    const overlap = takeOverlappingTile(visible, bucket);
+    if (overlap) {
+      if (placeholderState) cacheDetailTile(placeholderState);
+      detailLayer.insertBefore(overlap.canvas, detailLayer.firstChild);
+      placeholderState = { ...overlap, buffered: false };
+      applyTransient();
+    }
   }
 
   // First paint only the visible viewport for a fast sharp result.
@@ -404,22 +520,21 @@ async function renderDetail({ buffered = false, showLoading = true } = {}) {
       return;
     }
 
-    const previousCanvas = detailState && detailState.canvas;
+    const previousState = detailState;
+    const previousCanvas = previousState && previousState.canvas;
     const newPxPerPt = pixelW / tileW;
-    const oldPxPerPt = detailState && detailState.pxPerPt ? detailState.pxPerPt : 0;
-    if (detailState && Math.abs(detailState.scale - bucket) < 0.0001 &&
+    const oldPxPerPt = previousState && previousState.pxPerPt ? previousState.pxPerPt : 0;
+    if (previousState && Math.abs(previousState.scale - bucket) < 0.0001 &&
         oldPxPerPt > newPxPerPt * 1.01 && detailContainsVisible(visible, bucket)) {
       // What is already on screen is sharper than this pass: keep it.
       nextCanvas.width = 0;
       nextCanvas.height = 0;
       return;
     }
+    if (placeholderState) { cacheDetailTile(placeholderState); placeholderState = null; }
     detailLayer.replaceChildren(nextCanvas);
-    if (previousCanvas && previousCanvas !== nextCanvas) {
-      previousCanvas.width = 0;
-      previousCanvas.height = 0;
-    }
-    detailState = { canvas: nextCanvas, x: x0, y: y0, w: tileW, h: tileH, scale: bucket, pxPerPt: newPxPerPt };
+    if (previousCanvas && previousCanvas !== nextCanvas) cacheDetailTile(previousState);
+    detailState = { canvas: nextCanvas, x: x0, y: y0, w: tileW, h: tileH, scale: bucket, pxPerPt: newPxPerPt, buffered };
     lastRenderMs = Math.round(performance.now() - started);
     if (buffered) lastRefineRenderMs = lastRenderMs;
     else {
@@ -715,6 +830,9 @@ async function loadPage(n, { keepView = true } = {}) {
     detailState.canvas.width = 0;
     detailState.canvas.height = 0;
   }
+  clearTileCache();
+  if (placeholderState) releaseFrame({ cv: placeholderState.canvas });
+  placeholderState = null;
   detailLayer.replaceChildren();
   detailState = null;
   if (!keepView) { fitWidth(); }
@@ -807,6 +925,9 @@ window.__pz = {
       sharpLatencyMs: stats.sharpLatencyMs,
       cancels: stats.cancels,
       longTaskMaxMs: stats.longTaskMax,
+      tileCacheCount: tileCache.length,
+      tileCacheMpx: +(tileCachePixels / 1e6).toFixed(2),
+      cacheHits: stats.cacheHits,
     };
   },
   benchReset: () => {
@@ -819,7 +940,10 @@ window.__pz = {
   zoomTo: (target) => { zoomTo(target); render(); },
 
   prime: () => render(),
-  dbg: { render, page: () => page, previews: () => [...previewCache.keys()] },
+  dbg: { render, page: () => page, previews: () => [...previewCache.keys()],
+    tiles: () => tileCache.map((t) => ({ x: +t.x.toFixed(1), y: +t.y.toFixed(1), w: +t.w.toFixed(1), h: +t.h.toFixed(1), scale: +t.scale.toFixed(3), mpx: +(t.canvas.width * t.canvas.height / 1e6).toFixed(2) })),
+    visible: () => { const v = viewPts(); return { x0: +v.x0.toFixed(1), y0: +v.y0.toFixed(1), w: +v.w.toFixed(1), h: +v.h.toFixed(1) }; },
+  },
 };
 
 /* drag & drop (desktop) */
