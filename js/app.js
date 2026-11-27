@@ -171,6 +171,13 @@ function clearRenderCaches() {
   cancelHiRender();
   for (const frame of previewCache.values()) releaseFrame(frame);
   previewCache.clear();
+  if (detailState && detailState.tiles) {
+    for (const tile of detailState.tiles.values()) {
+      tile.canvas.width = 0;
+      tile.canvas.height = 0;
+    }
+    detailState.tiles.clear();
+  }
   detailLayer.replaceChildren();
   detailState = null;
   previewLayer.width = 1;
@@ -658,9 +665,12 @@ async function loadPage(n, { keepView = true } = {}) {
   if (doc !== pdf || generation !== documentGeneration || requestId !== pageRequestId) return;
   page = nextPage;
   pageNum = n;
-  if (detailState && detailState.canvas) {
-    detailState.canvas.width = 0;
-    detailState.canvas.height = 0;
+  if (detailState && detailState.tiles) {
+    for (const tile of detailState.tiles.values()) {
+      tile.canvas.width = 0;
+      tile.canvas.height = 0;
+    }
+    detailState.tiles.clear();
   }
   detailLayer.replaceChildren();
   detailState = null;
