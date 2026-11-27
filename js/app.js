@@ -714,6 +714,13 @@ async function saveRecentFile(data, name, existingId = null) {
       favorite: !!(previous && previous.favorite),
       openedAt: Date.now(), page: pageNum || 1
     });
+    const allReq = store.getAll();
+    allReq.onsuccess = () => {
+      const recent = (allReq.result || [])
+        .filter(item => !item.favorite)
+        .sort((a,b)=>(b.openedAt||0)-(a.openedAt||0));
+      for (const stale of recent.slice(20)) store.delete(stale.id);
+    };
     return id;
   } catch (err) {
     console.warn('library save failed', err);
@@ -816,6 +823,7 @@ async function toggleCurrentFavorite() {
 
 function closeReaderToHome() {
   document.body.classList.remove('hide-chrome');
+  cancelHiRender();
   stage.hidden = true;
   topEl.hidden = true;
   bottomEl.hidden = true;
