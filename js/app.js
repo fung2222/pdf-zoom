@@ -51,7 +51,7 @@ function toggleTheme() {
 }
 try { applyTheme(localStorage.getItem('pdf-zoom-theme') || 'dark'); } catch { applyTheme('dark'); }
 
-const MAX_ZOOM_RATIO = 40;     // 4000% relative to fit-to-width
+const MAX_ZOOM_RATIO = 45;     // 4500% relative to fit-to-width
 function maxScale() { return fitScale * MAX_ZOOM_RATIO; }
 const DPR = () => Math.min(window.devicePixelRatio || 1, 3);
 
@@ -161,6 +161,7 @@ stage.insertBefore(detailLayer, previewLayer.nextSibling);
 let detailState = null;
 let detailTask = null;
 let detailTimer = null;
+let detailRefineTimer = null;
 let detailGeneration = 0;
 
 function releaseFrame(frame) {
@@ -186,6 +187,8 @@ function clearRenderCaches() {
 
 function cancelHiRender() {
   clearTimeout(detailTimer);
+  clearTimeout(detailRefineTimer);
+  detailRefineTimer = null;
   detailGeneration++;
   if (detailTask) {
     try { detailTask.cancel(); } catch {}
@@ -290,7 +293,23 @@ function detailAreaCovers(visible, bucket) {
   return leftReady && rightReady && topReady && bottomReady;
 }
 
-async function renderDetail() {
+function detailContainsVisible(visible, bucket) {
+  if (!detailState || Math.abs(detailState.scale - bucket) > 0.0001) return false;
+  const d = detailState;
+  return visible.x0 >= d.x && visible.y0 >= d.y &&
+    visible.x0 + visible.w <= d.x + d.w &&
+    visible.y0 + visible.h <= d.y + d.h;
+}
+
+function scheduleDetailRefine() {
+  clearTimeout(detailRefineTimer);
+  detailRefineTimer = setTimeout(() => {
+    detailRefineTimer = null;
+    if (!gestureActive) renderDetail({ buffered: true, showLoading: false }).catch(err => console.warn(err));
+  }, 80);
+}
+
+async function renderDetail({ buffered = false, showLoading = true } = {}) {
   if (!pdf || !page || gestureActive) return;
   const doc = pdf;
   const pageRef = page;
@@ -307,12 +326,16 @@ async function renderDetail() {
     h: Math.max(1, Math.min(pageH, rawVisible.y0 + rawVisible.h) - Math.max(0, rawVisible.y0)),
   };
 
-  // Render the visible area plus a generous pan buffer, not the entire sheet.
-  // This keeps raster resolution high even on huge engineering drawings.
-  if (detailAreaCovers(visible, bucket)) return;
+  const alreadyVisible = detailContainsVisible(visible, bucket);
+  if (buffered ? detailAreaCovers(visible, bucket) : alreadyVisible) {
+    if (!buffered && !detailAreaCovers(visible, bucket)) scheduleDetailRefine();
+    return;
+  }
 
-  const padX = visible.w * 0.75;
-  const padY = visible.h * 0.75;
+  // First paint only the visible viewport for a fast sharp result.
+  // Then render a larger pan-buffer tile in the background.
+  const padX = buffered ? visible.w * 0.75 : 0;
+  const padY = buffered ? visible.h * 0.75 : 0;
   const x0 = Math.max(0, visible.x0 - padX);
   const y0 = Math.max(0, visible.y0 - padY);
   const x1 = Math.min(pageW, visible.x0 + visible.w + padX);
@@ -325,10 +348,11 @@ async function renderDetail() {
     try { detailTask.cancel(); } catch {}
     detailTask = null;
   }
-  beginLoading('正在載入高清區域');
+  if (showLoading) beginLoading('正在載入高清畫面');
 
   const started = performance.now();
   let nextCanvas = null;
+  let renderedOk = false;
   try {
     const baseScale = bucket * DPR();
     let outputScale = Math.min(1,
@@ -375,6 +399,7 @@ async function renderDetail() {
     lastVisibleRenderMs = lastRenderMs;
     lastRefineRenderMs = 0;
     applyTransient();
+    renderedOk = true;
   } catch (err) {
     if (nextCanvas) { nextCanvas.width = 0; nextCanvas.height = 0; }
     if (err && err.name !== 'RenderingCancelledException') {
@@ -382,12 +407,18 @@ async function renderDetail() {
     }
   } finally {
     if (detailTask && token === detailGeneration) detailTask = null;
-    endLoading();
+    if (showLoading) endLoading();
+    if (!buffered && renderedOk && token === detailGeneration &&
+        doc === pdf && pageRef === page && pageNo === pageNum && !gestureActive) {
+      scheduleDetailRefine();
+    }
   }
 }
 
 function scheduleDetailRender(immediate = false) {
   clearTimeout(detailTimer);
+  clearTimeout(detailRefineTimer);
+  detailRefineTimer = null;
   if (gestureActive) return;
   const delay = immediate ? 0 : 120;
   detailTimer = setTimeout(() => renderDetail().catch(err => console.warn(err)), delay);
