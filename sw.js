@@ -1,4 +1,4 @@
-const V = 'pdf-zoom-v14';
+const V = 'pdf-zoom-v15';
 const SHELL = [
   './',
   'index.html',
