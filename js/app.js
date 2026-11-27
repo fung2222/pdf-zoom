@@ -21,6 +21,36 @@ const homeTitle = document.getElementById('homeTitle');
 const currentFavoriteBtn = document.getElementById('favoriteBtn');
 let homeMode = 'recent';
 let currentFileId = null;
+const loadingIndicator = document.getElementById('loadingIndicator');
+const loadingText = document.getElementById('loadingText');
+let loadingCount = 0;
+function beginLoading(label = '載入中…') {
+  loadingCount++;
+  if (loadingText) loadingText.textContent = label;
+  if (loadingIndicator) loadingIndicator.hidden = false;
+}
+function endLoading() {
+  loadingCount = Math.max(0, loadingCount - 1);
+  if (!loadingCount && loadingIndicator) loadingIndicator.hidden = true;
+}
+
+function applyTheme(theme) {
+  const next = theme === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = next;
+  try { localStorage.setItem('pdf-zoom-theme', next); } catch {}
+  const label = next === 'dark' ? '☀ 明亮' : '☾ 黑暗';
+  const homeButton = document.getElementById('themeToggle');
+  const readerButton = document.getElementById('themeToggleReader');
+  if (homeButton) homeButton.textContent = label;
+  if (readerButton) readerButton.textContent = next === 'dark' ? '☀' : '☾';
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.content = next === 'dark' ? '#0b0b0c' : '#f4f5f7';
+}
+
+function toggleTheme() {
+  applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+}
+try { applyTheme(localStorage.getItem('pdf-zoom-theme') || 'dark'); } catch { applyTheme('dark'); }
 
 const MAX_SCALE = 30;          // 30 CSS px per PDF point ≈ 3000% print — plenty for site drawings
 const DPR = () => Math.min(window.devicePixelRatio || 1, 3);
@@ -266,123 +296,77 @@ async function renderDetail() {
   const pageRef = page;
   const pageNo = pageNum;
   const generation = documentGeneration;
-  const visible = viewPts();
   const pageViewport = pageRef.getViewport({ scale: 1 });
   const pageW = pageViewport.width, pageH = pageViewport.height;
-  const visibleX0 = Math.max(0, Math.min(pageW, visible.x0));
-  const visibleY0 = Math.max(0, Math.min(pageH, visible.y0));
-  const visibleX1 = Math.max(visibleX0, Math.min(pageW, visible.x0 + visible.w));
-  const visibleY1 = Math.max(visibleY0, Math.min(pageH, visible.y0 + visible.h));
-  const visibleArea = {
-    x0: visibleX0, y0: visibleY0,
-    w: Math.max(1, visibleX1 - visibleX0),
-    h: Math.max(1, visibleY1 - visibleY0),
-  };
   const bucket = quantizedScale();
-  if (detailAreaCovers(visibleArea, bucket)) return;
 
-  // Stage 1: make only the currently visible area sharp as quickly as possible.
-  // Stage 2: expand the sharp area in the background after the browser has painted stage 1.
-  const visiblePixels = Math.max(1, cw * ch * Math.pow(Math.min(window.devicePixelRatio || 1, 2), 2));
-  const maxLinearRatio = Math.sqrt(MAX_DETAIL_PIXELS / visiblePixels);
-  const overflow = Math.max(0, Math.min(1, (maxLinearRatio - 1) / 2));
-  const extraX = visibleArea.w * overflow;
-  const extraY = visibleArea.h * overflow;
-  const expandedArea = {
-    x0: Math.max(0, visibleArea.x0 - extraX),
-    y0: Math.max(0, visibleArea.y0 - extraY),
-    x1: Math.min(pageW, visibleArea.x0 + visibleArea.w + extraX),
-    y1: Math.min(pageH, visibleArea.y0 + visibleArea.h + extraY),
-  };
-  expandedArea.w = Math.max(1, expandedArea.x1 - expandedArea.x0);
-  expandedArea.h = Math.max(1, expandedArea.y1 - expandedArea.y0);
+  // Render the entire page at the settled zoom level. Once ready, panning
+  // stays inside this full-page canvas and does not trigger more PDF renders.
+  if (detailAreaCovers({ x0: 0, y0: 0, w: pageW, h: pageH }, bucket)) return;
 
   const token = ++detailGeneration;
   if (detailTask) {
     try { detailTask.cancel(); } catch {}
     detailTask = null;
   }
+  beginLoading('正在載入清晰畫面');
 
-  async function renderArea(area, phase) {
-    if (token !== detailGeneration || doc !== pdf || pageRef !== page ||
-        pageNo !== pageNum || generation !== documentGeneration) return false;
-
+  const started = performance.now();
+  let nextCanvas = null;
+  try {
     let outputScale = Math.min(window.devicePixelRatio || 1, 2);
     outputScale = Math.min(outputScale,
-      Math.sqrt(MAX_DETAIL_PIXELS / Math.max(1, area.w * area.h * bucket * bucket)));
+      Math.sqrt(MAX_DETAIL_PIXELS / Math.max(1, pageW * pageH * bucket * bucket)));
     outputScale = Math.min(outputScale,
-      MAX_DETAIL_DIMENSION / Math.max(1, area.w * bucket),
-      MAX_DETAIL_DIMENSION / Math.max(1, area.h * bucket));
-    outputScale = Math.max(0.5, outputScale);
+      MAX_DETAIL_DIMENSION / Math.max(1, pageW * bucket),
+      MAX_DETAIL_DIMENSION / Math.max(1, pageH * bucket));
+    outputScale = Math.max(0.05, outputScale);
 
-    const pixelW = Math.max(1, Math.ceil(area.w * bucket * outputScale));
-    const pixelH = Math.max(1, Math.ceil(area.h * bucket * outputScale));
-    const nextCanvas = document.createElement('canvas');
+    const pixelW = Math.max(1, Math.ceil(pageW * bucket * outputScale));
+    const pixelH = Math.max(1, Math.ceil(pageH * bucket * outputScale));
+    nextCanvas = document.createElement('canvas');
     nextCanvas.className = 'detail-canvas';
     nextCanvas.width = pixelW;
     nextCanvas.height = pixelH;
     nextCanvas.style.cssText =
-      `position:absolute;left:${area.x0}px;top:${area.y0}px;width:${area.w}px;height:${area.h}px;max-width:none;max-height:none;`;
+      `position:absolute;left:0;top:0;width:${pageW}px;height:${pageH}px;max-width:none;max-height:none;`;
 
     const viewport = pageRef.getViewport({ scale: bucket * outputScale });
-    const transform = [1, 0, 0, 1, -area.x0 * bucket * outputScale, -area.y0 * bucket * outputScale];
-    const started = performance.now();
     const task = pageRef.render({
       canvasContext: nextCanvas.getContext('2d', { alpha: false }),
       viewport,
-      transform,
       intent: 'display',
     });
     detailTask = task;
-    try {
-      await task.promise;
-      if (token !== detailGeneration || doc !== pdf || pageRef !== page ||
-          pageNo !== pageNum || generation !== documentGeneration) {
-        nextCanvas.width = 0;
-        nextCanvas.height = 0;
-        return false;
-      }
+    await task.promise;
 
-      const previousCanvas = detailState && detailState.canvas;
-      detailLayer.replaceChildren(nextCanvas);
-      if (previousCanvas && previousCanvas !== nextCanvas) {
-        previousCanvas.width = 0;
-        previousCanvas.height = 0;
-      }
-      detailState = {
-        canvas: nextCanvas,
-        x: area.x0, y: area.y0, w: area.w, h: area.h,
-        scale: bucket,
-      };
-      lastRenderMs = Math.round(performance.now() - started);
-      if (phase === 'visible') lastVisibleRenderMs = lastRenderMs;
-      else lastRefineRenderMs = lastRenderMs;
-      applyTransient();
-      return true;
-    } catch (err) {
+    if (token !== detailGeneration || doc !== pdf || pageRef !== page ||
+        pageNo !== pageNum || generation !== documentGeneration) {
       nextCanvas.width = 0;
       nextCanvas.height = 0;
-      if (err && err.name !== 'RenderingCancelledException') {
-        console.warn('Detail render failed', err);
-      }
-      return false;
-    } finally {
-      if (detailTask === task) detailTask = null;
+      return;
     }
+
+    const previousCanvas = detailState && detailState.canvas;
+    detailLayer.replaceChildren(nextCanvas);
+    if (previousCanvas && previousCanvas !== nextCanvas) {
+      previousCanvas.width = 0;
+      previousCanvas.height = 0;
+    }
+    detailState = { canvas: nextCanvas, x: 0, y: 0, w: pageW, h: pageH, scale: bucket };
+    lastRenderMs = Math.round(performance.now() - started);
+    lastVisibleRenderMs = lastRenderMs;
+    lastRefineRenderMs = 0;
+    applyTransient();
+  } catch (err) {
+    if (nextCanvas) { nextCanvas.width = 0; nextCanvas.height = 0; }
+    if (err && err.name !== 'RenderingCancelledException') {
+      console.warn('Full-page detail render failed', err);
+    }
+  } finally {
+    if (detailTask && token === detailGeneration) detailTask = null;
+    endLoading();
   }
-
-  if (!await renderArea(visibleArea, 'visible')) return;
-
-  // Give the browser a paint opportunity so the visible high-resolution layer
-  // is not held back by the larger background render.
-  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-  if (token !== detailGeneration || gestureActive) return;
-
-  const sameArea = Math.abs(expandedArea.x0 - visibleArea.x0) < 0.5 &&
-    Math.abs(expandedArea.y0 - visibleArea.y0) < 0.5 &&
-    Math.abs(expandedArea.w - visibleArea.w) < 0.5 &&
-    Math.abs(expandedArea.h - visibleArea.h) < 0.5;
-  if (!sameArea) await renderArea(expandedArea, 'refine');
 }
 
 function scheduleDetailRender(immediate = false) {
@@ -579,6 +563,7 @@ async function openPdf(data, name, existingFileId = null) {
   stage.hidden = false;
   topEl.hidden = false;
   spinner.hidden = false;
+  beginLoading('正在開啟 PDF');
   emptyEl.hidden = true;
   // pdf.js TRANSFERS the buffer to its worker, so keep a copy for IndexedDB first
   const keep = data.slice(0);
@@ -626,6 +611,7 @@ async function openPdf(data, name, existingFileId = null) {
     }
   } finally {
     if (openId === documentGeneration) spinner.hidden = true;
+    endLoading();
   }
 }
 
@@ -681,8 +667,11 @@ async function handleFile(file) {
     alert('只支援 PDF 檔案');
     return;
   }
-  const buf = await file.arrayBuffer();
-  await openPdf(new Uint8Array(buf), file.name);
+  beginLoading('正在讀取 PDF 檔案');
+  try {
+    const buf = await file.arrayBuffer();
+    await openPdf(new Uint8Array(buf), file.name);
+  } finally { endLoading(); }
 }
 
 fileInput.addEventListener('change', (e) => {
@@ -695,6 +684,8 @@ document.getElementById('openBtn').addEventListener('click', () => fileInput.cli
 document.getElementById('homeOpen').addEventListener('click', () => fileInput.click());
 document.getElementById('homeRecent').addEventListener('click', () => { homeMode='recent'; renderHome(); });
 document.getElementById('homeFavorites').addEventListener('click', () => { homeMode='favorites'; renderHome(); });
+document.getElementById('themeToggle').addEventListener('click', toggleTheme);
+document.getElementById('themeToggleReader').addEventListener('click', toggleTheme);
 document.getElementById('backHome').addEventListener('click', closeReaderToHome);
 currentFavoriteBtn.addEventListener('click', toggleCurrentFavorite);
 document.getElementById('pick').addEventListener('click', () => fileInput.click());
@@ -817,8 +808,11 @@ async function renderHome() {
     open.append(icon, meta);
     open.addEventListener('click', async () => {
       if (!file.blob) return;
-      const buf = await file.blob.arrayBuffer();
-      await openPdf(new Uint8Array(buf), file.name, file.id);
+      beginLoading('正在開啟文件');
+      try {
+        const buf = await file.blob.arrayBuffer();
+        await openPdf(new Uint8Array(buf), file.name, file.id);
+      } finally { endLoading(); }
     });
     const fav = document.createElement('button');
     fav.className = 'file-favorite' + (file.favorite ? ' selected' : '');
