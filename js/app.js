@@ -266,11 +266,14 @@ async function renderDetail() {
   const visible = viewPts();
   const pageViewport = pageRef.getViewport({ scale: 1 });
   const pageW = pageViewport.width, pageH = pageViewport.height;
+  const visibleX0 = Math.max(0, Math.min(pageW, visible.x0));
+  const visibleY0 = Math.max(0, Math.min(pageH, visible.y0));
+  const visibleX1 = Math.max(visibleX0, Math.min(pageW, visible.x0 + visible.w));
+  const visibleY1 = Math.max(visibleY0, Math.min(pageH, visible.y0 + visible.h));
   const visibleArea = {
-    x0: Math.max(0, Math.min(pageW, visible.x0)),
-    y0: Math.max(0, Math.min(pageH, visible.y0)),
-    w: Math.min(visible.w, pageW),
-    h: Math.min(visible.h, pageH),
+    x0: visibleX0, y0: visibleY0,
+    w: Math.max(1, visibleX1 - visibleX0),
+    h: Math.max(1, visibleY1 - visibleY0),
   };
   const bucket = quantizedScale();
   if (detailAreaCovers(visibleArea, bucket)) return;
@@ -595,6 +598,12 @@ async function loadPage(n, { keepView = true } = {}) {
   if (doc !== pdf || generation !== documentGeneration || requestId !== pageRequestId) return;
   page = nextPage;
   pageNum = n;
+  if (detailState && detailState.canvas) {
+    detailState.canvas.width = 0;
+    detailState.canvas.height = 0;
+  }
+  detailLayer.replaceChildren();
+  detailState = null;
   if (!keepView) { fitWidth(); }
   else { fitWidth(true); }
   let prev = previewCache.get(n);
