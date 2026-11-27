@@ -172,3 +172,68 @@ body.hide-chrome #top > *, body.hide-chrome #bottom > * { pointer-events: none; 
 .home-empty { padding:28px 12px; text-align:center; color:var(--muted); font-size:13px; line-height:1.7; }
 .home-share-note { margin:24px 4px 0; color:var(--muted); font-size:12px; text-align:center; }
 #stage[hidden], #home[hidden] { display:none !important; }
+
+
+/* ---------- loading indicator ---------- */
+.loading-indicator {
+  position: fixed;
+  z-index: 1000;
+  top: calc(76px + var(--safe-t));
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  max-width: calc(100vw - 32px);
+  padding: 9px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--fg);
+  background: var(--chrome);
+  box-shadow: 0 5px 24px rgba(0,0,0,.18);
+  font-size: 12px;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.loading-ring {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 17px;
+  border: 2px solid var(--line);
+  border-top-color: var(--fg);
+  border-radius: 50%;
+  animation: spin .72s linear infinite;
+}
+
+/* ---------- light theme ---------- */
+:root[data-theme="light"] {
+  --bg: #f4f5f7;
+  --chrome: rgba(255,255,255,.92);
+  --line: rgba(20,24,32,.14);
+  --fg: #20232a;
+  --muted: #707783;
+  --accent: #20232a;
+}
+:root[data-theme="light"] #home { background: var(--bg); }
+:root[data-theme="light"] .home-open {
+  background: #20232a;
+  color: #fff;
+  border-color: rgba(20,24,32,.12);
+}
+:root[data-theme="light"] .home-open > span:first-child { background: #3b414c; color: #fff; }
+:root[data-theme="light"] .home-open small { color: #d3d7df; }
+:root[data-theme="light"] .home-tab { background: #e8eaee; color: #626a76; }
+:root[data-theme="light"] .home-tab.active { background: #fff; color: #20232a; border-color: rgba(20,24,32,.18); }
+:root[data-theme="light"] .file-icon { background: #e3e6eb; color: #303641; }
+:root[data-theme="light"] button.primary { background: #20232a; color: #fff; }
+:root[data-theme="light"] #view { box-shadow: 0 0 0 1px rgba(0,0,0,.12); }
+.theme-toggle {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 9px 12px;
+  color: var(--fg);
+  background: var(--chrome);
+  font-size: 12px;
+  white-space: nowrap;
+}
