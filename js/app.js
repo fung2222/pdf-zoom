@@ -15,6 +15,12 @@ const pgLabel = document.getElementById('pgLabel');
 const zoomLabel = document.getElementById('zoomLabel');
 const fitBtn = document.getElementById('fitBtn');
 const fileInput = document.getElementById('file');
+const homeEl = document.getElementById('home');
+const homeList = document.getElementById('homeList');
+const homeTitle = document.getElementById('homeTitle');
+const currentFavoriteBtn = document.getElementById('favoriteBtn');
+let homeMode = 'recent';
+let currentFileId = null;
 
 const MAX_SCALE = 30;          // 30 CSS px per PDF point ≈ 3000% print — plenty for site drawings
 const DPR = () => Math.min(window.devicePixelRatio || 1, 3);
@@ -65,20 +71,20 @@ function pageSize() {
 function clampView() {
   const { w, h } = pageSize();
   const contentW = w * s, contentH = h * s;
-  const loX = Math.min(0, contentW - cw), hiX = Math.max(0, contentW - cw);
-  const loY = Math.min(0, contentH - ch), hiY = Math.max(0, contentH - ch);
-  tx = Math.min(hiX, Math.max(loX, tx));
-  ty = Math.min(hiY, Math.max(loY, ty));
+  if (contentW <= cw) tx = (cw - contentW) / 2;
+  else tx = Math.min(0, Math.max(cw - contentW, tx));
+  if (contentH <= ch) ty = (ch - contentH) / 2;
+  else ty = Math.min(0, Math.max(ch - contentH, ty));
 }
 
 function fitWidth(keepY = false) {
   const { w } = pageSize();
   fitScale = cw / w;
   s = fitScale;
-  tx = 0;
+  tx = (cw - w * s) / 2;
   if (!keepY) {
     const { h } = pageSize();
-    ty = Math.min(0, Math.max(0, (h * s - ch) / 2));
+    ty = (ch - h * s) / 2;
   }
   clampView();
 }
@@ -187,7 +193,7 @@ function tileDpr() {
 }
 
 function viewPts() {
-  return { x0: tx / s, y0: ty / s, w: cw / s, h: ch / s };
+  return { x0: -tx / s, y0: -ty / s, w: cw / s, h: ch / s };
 }
 
 function applyTransient() {
@@ -581,7 +587,7 @@ stage.addEventListener('wheel', (e) => {
 
 /* ---------------- open pdf ---------------- */
 
-async function openPdf(data, name) {
+async function openPdf(data, name, existingFileId = null) {
   const openId = ++documentGeneration;
   pageRequestId++;
   primeGeneration++;
@@ -612,7 +618,14 @@ async function openPdf(data, name) {
     topEl.hidden = false; bottomEl.hidden = false;
     pgLabel.hidden = false; fitBtn.hidden = false;
     lastFile = { name: name || 'document.pdf' };
+    homeEl.hidden = true;
+    stage.hidden = false;
+    topEl.hidden = false; bottomEl.hidden = false;
+    pgLabel.hidden = false; fitBtn.hidden = false;
+    currentFileId = await saveRecentFile(keep, lastFile.name, existingFileId);
+    lastFile.id = currentFileId;
     await saveLast(keep, lastFile.name);
+    updateFavoriteButton();
     showChrome();
   } catch (err) {
     if (openId === documentGeneration) {
@@ -682,6 +695,11 @@ fileInput.addEventListener('change', (e) => {
 });
 
 document.getElementById('openBtn').addEventListener('click', () => fileInput.click());
+document.getElementById('homeOpen').addEventListener('click', () => fileInput.click());
+document.getElementById('homeRecent').addEventListener('click', () => { homeMode='recent'; renderHome(); });
+document.getElementById('homeFavorites').addEventListener('click', () => { homeMode='favorites'; renderHome(); });
+document.getElementById('backHome').addEventListener('click', closeReaderToHome);
+currentFavoriteBtn.addEventListener('click', toggleCurrentFavorite);
 document.getElementById('pick').addEventListener('click', () => fileInput.click());
 document.getElementById('next').addEventListener('click', nextPage);
 document.getElementById('prev').addEventListener('click', prevPage);
@@ -721,12 +739,146 @@ stage.addEventListener('drop', (e) => {
   if (f) handleFile(f);
 });
 
+
+/* ---------------- home library ---------------- */
+
+function makeFileId() {
+  return (crypto && crypto.randomUUID) ? crypto.randomUUID() : 'f-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+}
+
+async function saveRecentFile(data, name, existingId = null) {
+  try {
+    const db = await idb();
+    const id = existingId || makeFileId();
+    const tx = db.transaction('files', 'readwrite');
+    const store = tx.objectStore('files');
+    const previous = await new Promise(resolve => {
+      const req = store.get(id);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+    });
+    store.put({
+      id, name, blob: new Blob([data], {type:'application/pdf'}),
+      favorite: !!(previous && previous.favorite),
+      openedAt: Date.now(), page: pageNum || 1
+    });
+    return id;
+  } catch (err) {
+    console.warn('library save failed', err);
+    return existingId;
+  }
+}
+
+async function getLibraryFiles() {
+  const db = await idb();
+  const tx = db.transaction('files', 'readonly');
+  const req = tx.objectStore('files').getAll();
+  return await new Promise(resolve => {
+    req.onsuccess = () => resolve((req.result || []).sort((a,b)=>(b.openedAt||0)-(a.openedAt||0)));
+    req.onerror = () => resolve([]);
+  });
+}
+
+async function renderHome() {
+  if (!homeList) return;
+  homeTitle.textContent = homeMode === 'favorites' ? '收藏' : '最近開啟';
+  homeList.replaceChildren();
+  const files = await getLibraryFiles();
+  const shown = homeMode === 'favorites' ? files.filter(f=>f.favorite) : files;
+  if (!shown.length) {
+    const empty = document.createElement('div');
+    empty.className = 'home-empty';
+    empty.textContent = homeMode === 'favorites' ? '未有收藏的 PDF' : '尚未開啟 PDF。可以選擇檔案，或從 WhatsApp 分享進來。';
+    homeList.appendChild(empty);
+    return;
+  }
+  for (const file of shown.slice(0, 30)) {
+    const item = document.createElement('article');
+    item.className = 'file-row';
+    const open = document.createElement('button');
+    open.className = 'file-open';
+    open.type = 'button';
+    const icon = document.createElement('span');
+    icon.className = 'file-icon';
+    icon.textContent = 'PDF';
+    const meta = document.createElement('span');
+    meta.className = 'file-meta';
+    const title = document.createElement('strong');
+    title.textContent = file.name || 'document.pdf';
+    const sub = document.createElement('small');
+    sub.textContent = new Date(file.openedAt || Date.now()).toLocaleString();
+    meta.append(title, sub);
+    open.append(icon, meta);
+    open.addEventListener('click', async () => {
+      if (!file.blob) return;
+      const buf = await file.blob.arrayBuffer();
+      await openPdf(new Uint8Array(buf), file.name, file.id);
+    });
+    const fav = document.createElement('button');
+    fav.className = 'file-favorite' + (file.favorite ? ' selected' : '');
+    fav.type = 'button';
+    fav.setAttribute('aria-label', file.favorite ? '取消收藏' : '加入收藏');
+    fav.textContent = file.favorite ? '★' : '☆';
+    fav.addEventListener('click', async () => {
+      const db = await idb();
+      const tx = db.transaction('files','readwrite');
+      const store = tx.objectStore('files');
+      const req = store.get(file.id);
+      req.onsuccess = () => {
+        const rec = req.result;
+        if (rec) { rec.favorite = !rec.favorite; store.put(rec); }
+      };
+      tx.oncomplete = renderHome;
+    });
+    item.append(open, fav);
+    homeList.appendChild(item);
+  }
+}
+
+function updateFavoriteButton() {
+  if (!currentFavoriteBtn) return;
+  currentFavoriteBtn.hidden = !pdf;
+  currentFavoriteBtn.textContent = '☆';
+  if (!currentFileId) return;
+  getLibraryFiles().then(files => {
+    const rec = files.find(f=>f.id===currentFileId);
+    currentFavoriteBtn.textContent = rec && rec.favorite ? '★' : '☆';
+    currentFavoriteBtn.classList.toggle('selected', !!(rec && rec.favorite));
+  });
+}
+
+async function toggleCurrentFavorite() {
+  if (!currentFileId) return;
+  const db = await idb();
+  const tx = db.transaction('files','readwrite');
+  const store = tx.objectStore('files');
+  const req = store.get(currentFileId);
+  req.onsuccess = () => {
+    const rec = req.result;
+    if (rec) { rec.favorite = !rec.favorite; store.put(rec); }
+  };
+  tx.oncomplete = updateFavoriteButton;
+}
+
+function closeReaderToHome() {
+  document.body.classList.remove('hide-chrome');
+  stage.hidden = true;
+  topEl.hidden = true;
+  bottomEl.hidden = true;
+  homeEl.hidden = false;
+  renderHome();
+}
+
 /* ---------------- tiny idb ---------------- */
 
 function idb() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('pdf-zoom', 1);
-    req.onupgradeneeded = () => req.result.createObjectStore('kv');
+    const req = indexedDB.open('pdf-zoom', 2);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');
+      if (!db.objectStoreNames.contains('files')) db.createObjectStore('files', { keyPath: 'id' });
+    };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
@@ -916,7 +1068,9 @@ async function tryShared() {
       }
     } catch (e) { console.warn('url open failed', e); }
   }
-  await showSnapFirst();          // instant picture while the file is read
-  const ok = await restoreLast();
-  if (!ok && emptyEl.hidden === false) emptyEl.hidden = false;
+  // A normal app launch always starts on the library home screen.
+  stage.hidden = true;
+  topEl.hidden = true; bottomEl.hidden = true;
+  homeEl.hidden = false;
+  await renderHome();
 })();
