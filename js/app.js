@@ -111,7 +111,7 @@ function zoomTo(nextS, clientX = cw / 2, clientY = ch / 2) {
 
 /* ---------------- rendering: full-page preview + one detail canvas ---------------- */
 
-const MAX_DETAIL_PIXELS = 16 * 1024 * 1024;
+const MAX_DETAIL_PIXELS = 8 * 1024 * 1024;
 const MAX_DETAIL_DIMENSION = 8192;
 const MAX_PREVIEW_PIXELS = 1.2e6;
 const previewCache = new Map();
@@ -537,6 +537,7 @@ async function openPdf(data, name, existingFileId = null) {
   cancelHiRender();
   homeEl.hidden = true;
   stage.hidden = false;
+  topEl.hidden = false;
   spinner.hidden = false;
   emptyEl.hidden = true;
   // pdf.js TRANSFERS the buffer to its worker, so keep a copy for IndexedDB first
