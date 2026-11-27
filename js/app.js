@@ -51,7 +51,7 @@ function toggleTheme() {
 }
 try { applyTheme(localStorage.getItem('pdf-zoom-theme') || 'dark'); } catch { applyTheme('dark'); }
 
-const MAX_SCALE = 30;          // 30 CSS px per PDF point ≈ 3000% print — plenty for site drawings
+const MAX_ZOOM_RATIO = 40;     // 4000% relative to fit-to-width
 const DPR = () => Math.min(window.devicePixelRatio || 1, 3);
 
 let pdf = null;
@@ -128,7 +128,7 @@ function stagePoint(clientX, clientY) {
 
 function zoomAt(clientX, clientY, factor) {
   const p = stagePoint(clientX, clientY);
-  const ns = Math.min(MAX_SCALE, Math.max(fitScale * 0.8, s * factor));
+  const ns = Math.min(fitScale * MAX_ZOOM_RATIO, Math.max(fitScale * 0.8, s * factor));
   const k = ns / s;
   // Keep the PDF point beneath the fingers anchored beneath the same point.
   tx = p.x - (p.x - tx) * k;
@@ -270,24 +270,14 @@ function blitFrame(frame) {
   applyTransient();
 }
 
-function detailAreaCovers(visible, bucket) {
-  if (!detailState || Math.abs(detailState.scale - bucket) > 0.0001) return false;
-  const d = detailState;
-  const pageViewport = page.getViewport({ scale: 1 });
-  const right = d.x + d.w, bottom = d.y + d.h;
-  if (visible.x0 < d.x || visible.y0 < d.y ||
-      visible.x0 + visible.w > right || visible.y0 + visible.h > bottom) return false;
-  const leftPad = visible.x0 - d.x;
-  const rightPad = right - (visible.x0 + visible.w);
-  const topPad = visible.y0 - d.y;
-  const bottomPad = bottom - (visible.y0 + visible.h);
-  // At a physical page edge no extra margin is needed on that side.
-  const leftReady = d.x <= 0 || leftPad > visible.w * 0.5;
-  const rightReady = right >= pageViewport.width || rightPad > visible.w * 0.5;
-  const topReady = d.y <= 0 || topPad > visible.h * 0.5;
-  const bottomReady = bottom >= pageViewport.height || bottomPad > visible.h * 0.5;
-  return leftReady && rightReady && topReady && bottomReady;
-}
+/*
+ * Tile-based detail renderer.
+ * Each tile is rendered directly from PDF.js at the settled zoom scale.
+ * A bounded tile cache keeps memory predictable on Android while allowing
+ * arbitrarily high zoom ratios without rasterizing the entire page.
+ */
+const DETAIL_TILE_PIXELS = 768;
+const MAX_DETAIL_TILES = 12;
 
 async function renderDetail() {
   if (!pdf || !page || gestureActive) return;
@@ -298,69 +288,110 @@ async function renderDetail() {
   const pageViewport = pageRef.getViewport({ scale: 1 });
   const pageW = pageViewport.width, pageH = pageViewport.height;
   const bucket = quantizedScale();
+  const outputScale = Math.min(window.devicePixelRatio || 1, 2);
+  const renderScale = bucket * outputScale;
+  const tileSpan = DETAIL_TILE_PIXELS / renderScale;
+  const visible = viewPts();
+  const left = Math.max(0, visible.x0 - tileSpan);
+  const top = Math.max(0, visible.y0 - tileSpan);
+  const right = Math.min(pageW, visible.x0 + visible.w + tileSpan);
+  const bottom = Math.min(pageH, visible.y0 + visible.h + tileSpan);
+  const minX = Math.floor(left / tileSpan);
+  const minY = Math.floor(top / tileSpan);
+  const maxX = Math.floor(Math.max(0, right - 0.001) / tileSpan);
+  const maxY = Math.floor(Math.max(0, bottom - 0.001) / tileSpan);
+  const wanted = [];
 
-  // Render the entire page at the settled zoom level. Once ready, panning
-  // stays inside this full-page canvas and does not trigger more PDF renders.
-  if (detailAreaCovers({ x0: 0, y0: 0, w: pageW, h: pageH }, bucket)) return;
+  for (let iy = minY; iy <= maxY; iy++) {
+    for (let ix = minX; ix <= maxX; ix++) {
+      const x = ix * tileSpan, y = iy * tileSpan;
+      const w = Math.min(tileSpan, pageW - x);
+      const h = Math.min(tileSpan, pageH - y);
+      if (w > 0 && h > 0) wanted.push({ ix, iy, x, y, w, h, key: ix + ':' + iy });
+    }
+  }
 
   const token = ++detailGeneration;
   if (detailTask) {
     try { detailTask.cancel(); } catch {}
     detailTask = null;
   }
-  beginLoading('正在載入清晰畫面');
 
+  if (!detailState || Math.abs(detailState.scale - bucket) > 0.0001) {
+    detailLayer.replaceChildren();
+    detailState = { scale: bucket, tiles: new Map() };
+  }
+
+  const missing = wanted.filter(tile => !detailState.tiles.has(tile.key));
+  if (!missing.length) return;
+
+  beginLoading('正在載入高清細節');
   const started = performance.now();
-  let nextCanvas = null;
   try {
-    let outputScale = Math.min(window.devicePixelRatio || 1, 2);
-    outputScale = Math.min(outputScale,
-      Math.sqrt(MAX_DETAIL_PIXELS / Math.max(1, pageW * pageH * bucket * bucket)));
-    outputScale = Math.min(outputScale,
-      MAX_DETAIL_DIMENSION / Math.max(1, pageW * bucket),
-      MAX_DETAIL_DIMENSION / Math.max(1, pageH * bucket));
-    outputScale = Math.max(0.05, outputScale);
+    const viewport = pageRef.getViewport({ scale: renderScale });
+    for (const tile of missing) {
+      if (token !== detailGeneration || doc !== pdf || pageRef !== page ||
+          pageNo !== pageNum || generation !== documentGeneration || gestureActive) break;
 
-    const pixelW = Math.max(1, Math.ceil(pageW * bucket * outputScale));
-    const pixelH = Math.max(1, Math.ceil(pageH * bucket * outputScale));
-    nextCanvas = document.createElement('canvas');
-    nextCanvas.className = 'detail-canvas';
-    nextCanvas.width = pixelW;
-    nextCanvas.height = pixelH;
-    nextCanvas.style.cssText =
-      `position:absolute;left:0;top:0;width:${pageW}px;height:${pageH}px;max-width:none;max-height:none;`;
+      const tileCanvas = document.createElement('canvas');
+      tileCanvas.className = 'detail-canvas';
+      const pixelW = Math.max(1, Math.ceil(tile.w * renderScale));
+      const pixelH = Math.max(1, Math.ceil(tile.h * renderScale));
+      tileCanvas.width = pixelW;
+      tileCanvas.height = pixelH;
+      tileCanvas.style.cssText =
+        `position:absolute;left:${tile.x}px;top:${tile.y}px;width:${tile.w}px;height:${tile.h}px;max-width:none;max-height:none;`;
 
-    const viewport = pageRef.getViewport({ scale: bucket * outputScale });
-    const task = pageRef.render({
-      canvasContext: nextCanvas.getContext('2d', { alpha: false }),
-      viewport,
-      intent: 'display',
-    });
-    detailTask = task;
-    await task.promise;
-
-    if (token !== detailGeneration || doc !== pdf || pageRef !== page ||
-        pageNo !== pageNum || generation !== documentGeneration) {
-      nextCanvas.width = 0;
-      nextCanvas.height = 0;
-      return;
+      try {
+        const task = pageRef.render({
+          canvasContext: tileCanvas.getContext('2d', { alpha: false }),
+          viewport,
+          transform: [1, 0, 0, 1, -tile.x * renderScale, -tile.y * renderScale],
+          intent: 'display',
+        });
+        detailTask = task;
+        await task.promise;
+        if (token !== detailGeneration || doc !== pdf || pageRef !== page ||
+            pageNo !== pageNum || generation !== documentGeneration) {
+          tileCanvas.width = 0;
+          tileCanvas.height = 0;
+          break;
+        }
+        detailLayer.appendChild(tileCanvas);
+        detailState.tiles.set(tile.key, { canvas: tileCanvas, x: tile.x, y: tile.y });
+      } catch (err) {
+        tileCanvas.width = 0;
+        tileCanvas.height = 0;
+        if (err && err.name === 'RenderingCancelledException') break;
+        throw err;
+      } finally {
+        if (detailTask) detailTask = null;
+      }
     }
 
-    const previousCanvas = detailState && detailState.canvas;
-    detailLayer.replaceChildren(nextCanvas);
-    if (previousCanvas && previousCanvas !== nextCanvas) {
-      previousCanvas.width = 0;
-      previousCanvas.height = 0;
+    // Keep only nearby tiles; never let a long pan session grow memory without bound.
+    const centerX = visible.x0 + visible.w / 2;
+    const centerY = visible.y0 + visible.h / 2;
+    const ranked = [...detailState.tiles.entries()].map(([key, tile]) => ({
+      key, tile,
+      distance: Math.hypot(tile.x - centerX, tile.y - centerY),
+    })).sort((a, b) => a.distance - b.distance);
+    const keep = new Set(ranked.slice(0, MAX_DETAIL_TILES).map(item => item.key));
+    for (const [key, tile] of detailState.tiles) {
+      if (!keep.has(key)) {
+        tile.canvas.remove();
+        tile.canvas.width = 0;
+        tile.canvas.height = 0;
+        detailState.tiles.delete(key);
+      }
     }
-    detailState = { canvas: nextCanvas, x: 0, y: 0, w: pageW, h: pageH, scale: bucket };
     lastRenderMs = Math.round(performance.now() - started);
     lastVisibleRenderMs = lastRenderMs;
     lastRefineRenderMs = 0;
     applyTransient();
   } catch (err) {
-    if (nextCanvas) { nextCanvas.width = 0; nextCanvas.height = 0; }
     if (err && err.name !== 'RenderingCancelledException') {
-      console.warn('Full-page detail render failed', err);
+      console.warn('Tiled detail render failed', err);
     }
   } finally {
     if (detailTask && token === detailGeneration) detailTask = null;
@@ -491,7 +522,7 @@ stage.addEventListener('pointermove', (e) => {
     moved = 99;
     const factor = dist / Math.max(12, pinchStart.dist);
     // Keep the PDF point under the initial pinch midpoint under the moving midpoint.
-    const ns = Math.min(MAX_SCALE, Math.max(fitScale * 0.8, pinchStart.s * factor));
+    const ns = Math.min(fitScale * MAX_ZOOM_RATIO, Math.max(fitScale * 0.8, pinchStart.s * factor));
     const k = ns / pinchStart.s;
     tx = cx - (pinchStart.cx - pinchStart.tx) * k;
     ty = cy - (pinchStart.cy - pinchStart.ty) * k;
@@ -706,7 +737,7 @@ window.__pz = {
   state: () => ({ s, tx, ty, fitScale, pageNum, pageCount, cw, ch }),
   pan: (dx, dy) => { tx -= dx; ty -= dy; clampView(); render(); },
   zoomAt, fit: () => { fitWidth(); render(); }, nextPage, prevPage,
-  perf: () => ({ detailReady: !!detailState, detailScale: detailState ? +detailState.scale.toFixed(3) : 0, previews: previewCache.size, lastRenderMs, lastVisibleRenderMs, lastRefineRenderMs }),
+  perf: () => ({ detailReady: !!(detailState && detailState.tiles && detailState.tiles.size), detailTiles: detailState && detailState.tiles ? detailState.tiles.size : 0, detailScale: detailState ? +detailState.scale.toFixed(3) : 0, previews: previewCache.size, lastRenderMs, lastVisibleRenderMs, lastRefineRenderMs }),
   zoom: (f) => { zoomAt(cw / 2, ch / 2, f); render(); },
   zoomTo: (target) => { zoomTo(target); render(); },
 
