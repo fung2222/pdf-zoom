@@ -678,7 +678,7 @@ window.__pz = {
   zoomTo: (target) => { zoomTo(target); render(); },
 
   prime: () => render(),
-  dbg: { render, page: () => page, previews: () => [...previewCache.keys()], tiles: () => [...tileCache.keys()] },
+  dbg: { render, page: () => page, previews: () => [...previewCache.keys()] },
 };
 
 /* drag & drop (desktop) */
