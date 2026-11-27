@@ -51,7 +51,7 @@ function toggleTheme() {
 }
 try { applyTheme(localStorage.getItem('pdf-zoom-theme') || 'dark'); } catch { applyTheme('dark'); }
 
-const MAX_ZOOM_RATIO = 45;     // 4500% relative to fit-to-width
+const MAX_ZOOM_RATIO = 50;     // 5000% relative to fit-to-width
 function maxScale() { return fitScale * MAX_ZOOM_RATIO; }
 const DPR = () => Math.min(window.devicePixelRatio || 1, 3);
 
