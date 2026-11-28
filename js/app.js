@@ -215,7 +215,7 @@ function quantizedScale() {
 
 /* -------- detail tile cache: pan back into a seen area without re-rendering -------- */
 
-const MAX_TILE_CACHE_PIXELS = 10 * 1024 * 1024;   // ≈ 3 sharp viewport tiles on a phone
+const MAX_TILE_CACHE_PIXELS = 16 * 1024 * 1024;   // ≈ 4–5 sharp viewport tiles (~64MB)
 let tileCache = [];
 let tileCachePixels = 0;
 let tileBucket = 0;
@@ -231,6 +231,8 @@ function cacheDetailTile(state) {
   // Only keep viewport-sized sharp tiles: a padded pan-buffer tile costs ~2.6×
   // the pixels and would evict the small tiles that make pan-back instant.
   if (state.buffered) return;
+  const needed = state.scale * DPR();
+  if (state.pxPerPt && needed && state.pxPerPt < needed * 0.9) return;   // skip coarse passes
   const pixels = state.canvas.width * state.canvas.height;
   if (!pixels || pixels > MAX_TILE_CACHE_PIXELS) return;
   for (let i = tileCache.length - 1; i >= 0; i--) {
@@ -483,75 +485,98 @@ async function renderDetail({ buffered = false, showLoading = true } = {}) {
   if (showLoading) beginLoading('正在載入高清畫面');
 
   const started = performance.now();
-  let nextCanvas = null;
+  const neededPx = Math.max(1, cw * ch * dpr * dpr);
+  // Progressive first paint: a full-resolution viewport tile is ~3.4MP on a
+  // phone and that is what makes a new position feel slow. Paint a coarse pass
+  // first (~1/3 of the pixels), then the exact tile on top.
+  const qualities = buffered ? [1] : (neededPx > 1.2e6 ? [0.6, 1] : [1]);
   let renderedOk = false;
-  try {
-    const baseScale = bucket * dpr;
-    let outputScale = Math.min(1,
-      Math.sqrt(MAX_DETAIL_PIXELS / Math.max(1, tileW * tileH * baseScale * baseScale)),
-      MAX_DETAIL_DIMENSION / Math.max(1, tileW * baseScale),
-      MAX_DETAIL_DIMENSION / Math.max(1, tileH * baseScale));
-    outputScale = Math.max(0.001, outputScale);
-    const renderScale = baseScale * outputScale;
+  let firstShownAt = 0;
 
-    const pixelW = Math.max(1, Math.ceil(tileW * renderScale));
-    const pixelH = Math.max(1, Math.ceil(tileH * renderScale));
-    nextCanvas = document.createElement('canvas');
-    nextCanvas.className = 'detail-canvas';
-    nextCanvas.width = pixelW;
-    nextCanvas.height = pixelH;
-    nextCanvas.style.cssText =
-      `position:absolute;left:${x0}px;top:${y0}px;width:${tileW}px;height:${tileH}px;max-width:none;max-height:none;`;
+  const paintAt = async (quality) => {
+    let nextCanvas = null;
+    try {
+      const baseScale = bucket * dpr * quality;
+      let outputScale = Math.min(1,
+        Math.sqrt(MAX_DETAIL_PIXELS / Math.max(1, tileW * tileH * baseScale * baseScale)),
+        MAX_DETAIL_DIMENSION / Math.max(1, tileW * baseScale),
+        MAX_DETAIL_DIMENSION / Math.max(1, tileH * baseScale));
+      outputScale = Math.max(0.001, outputScale);
+      const renderScale = baseScale * outputScale;
 
-    const viewport = pageRef.getViewport({ scale: renderScale });
-    const task = pageRef.render({
-      canvasContext: nextCanvas.getContext('2d', { alpha: false }),
-      viewport,
-      transform: [1, 0, 0, 1, -x0 * renderScale, -y0 * renderScale],
-      intent: 'display',
-    });
-    detailTask = task;
-    await task.promise;
+      const pixelW = Math.max(1, Math.ceil(tileW * renderScale));
+      const pixelH = Math.max(1, Math.ceil(tileH * renderScale));
+      nextCanvas = document.createElement('canvas');
+      nextCanvas.className = 'detail-canvas';
+      nextCanvas.width = pixelW;
+      nextCanvas.height = pixelH;
+      nextCanvas.style.cssText =
+        `position:absolute;left:${x0}px;top:${y0}px;width:${tileW}px;height:${tileH}px;max-width:none;max-height:none;`;
 
-    if (token !== detailGeneration || doc !== pdf || pageRef !== page ||
-        pageNo !== pageNum || generation !== documentGeneration) {
-      nextCanvas.width = 0;
-      nextCanvas.height = 0;
-      return;
-    }
+      const viewport = pageRef.getViewport({ scale: renderScale });
+      const task = pageRef.render({
+        canvasContext: nextCanvas.getContext('2d', { alpha: false }),
+        viewport,
+        transform: [1, 0, 0, 1, -x0 * renderScale, -y0 * renderScale],
+        intent: 'display',
+      });
+      detailTask = task;
+      await task.promise;
 
-    const previousState = detailState;
-    const previousCanvas = previousState && previousState.canvas;
-    const newPxPerPt = pixelW / tileW;
-    const oldPxPerPt = previousState && previousState.pxPerPt ? previousState.pxPerPt : 0;
-    if (previousState && Math.abs(previousState.scale - bucket) < 0.0001 &&
-        oldPxPerPt > newPxPerPt * 1.01 && detailContainsVisible(visible, bucket)) {
-      // What is already on screen is sharper than this pass: keep it.
-      nextCanvas.width = 0;
-      nextCanvas.height = 0;
-      return;
-    }
-    if (placeholderState) { cacheDetailTile(placeholderState); placeholderState = null; }
-    detailLayer.replaceChildren(nextCanvas);
-    if (previousCanvas && previousCanvas !== nextCanvas) cacheDetailTile(previousState);
-    detailState = { canvas: nextCanvas, x: x0, y: y0, w: tileW, h: tileH, scale: bucket, pxPerPt: newPxPerPt, buffered };
-    lastRenderMs = Math.round(performance.now() - started);
-    if (buffered) lastRefineRenderMs = lastRenderMs;
-    else {
-      lastVisibleRenderMs = lastRenderMs;
-      lastRefineRenderMs = 0;
-      stats.sharpAt = performance.now();
-      if (stats.gestureEndAt) {
-        stats.sharpLatencyMs = Math.round(stats.sharpAt - stats.gestureEndAt);
-        stats.gestureEndAt = 0;
+      if (token !== detailGeneration || doc !== pdf || pageRef !== page || pageNo !== pageNum ||
+          generation !== documentGeneration || gestureActive) {
+        nextCanvas.width = 0;
+        nextCanvas.height = 0;
+        return false;
       }
+
+      const previousState = detailState;
+      const previousCanvas = previousState && previousState.canvas;
+      const newPxPerPt = pixelW / tileW;
+      const oldPxPerPt = previousState && previousState.pxPerPt ? previousState.pxPerPt : 0;
+      if (previousState && Math.abs(previousState.scale - bucket) < 0.0001 &&
+          oldPxPerPt > newPxPerPt * 1.01 && detailContainsVisible(visible, bucket)) {
+        // What is already on screen is sharper than this pass: keep it.
+        nextCanvas.width = 0;
+        nextCanvas.height = 0;
+        return false;
+      }
+      if (placeholderState) { cacheDetailTile(placeholderState); placeholderState = null; }
+      detailLayer.replaceChildren(nextCanvas);
+      if (previousCanvas && previousCanvas !== nextCanvas) cacheDetailTile(previousState);
+      detailState = { canvas: nextCanvas, x: x0, y: y0, w: tileW, h: tileH, scale: bucket, pxPerPt: newPxPerPt, buffered };
+      const doneAt = performance.now();
+      lastRenderMs = Math.round(doneAt - started);
+      if (buffered) {
+        lastRefineRenderMs = lastRenderMs;
+      } else {
+        lastVisibleRenderMs = Math.round(doneAt - started);
+        lastRefineRenderMs = 0;
+        if (!firstShownAt) {
+          firstShownAt = doneAt;
+          stats.sharpAt = doneAt;
+          if (stats.gestureEndAt) {
+            stats.sharpLatencyMs = Math.round(doneAt - stats.gestureEndAt);
+            stats.gestureEndAt = 0;
+          }
+        }
+      }
+      applyTransient();
+      return true;
+    } catch (err) {
+      if (nextCanvas) { nextCanvas.width = 0; nextCanvas.height = 0; }
+      if (err && err.name !== 'RenderingCancelledException') {
+        console.warn('Tiled detail render failed', err);
+      }
+      return false;
     }
-    applyTransient();
-    renderedOk = true;
-  } catch (err) {
-    if (nextCanvas) { nextCanvas.width = 0; nextCanvas.height = 0; }
-    if (err && err.name !== 'RenderingCancelledException') {
-      console.warn('Tiled detail render failed', err);
+  };
+
+  try {
+    for (const quality of qualities) {
+      if (!await paintAt(quality)) break;
+      renderedOk = true;
+      if (token !== detailGeneration || gestureActive) break;
     }
   } finally {
     if (detailTask && token === detailGeneration) detailTask = null;
